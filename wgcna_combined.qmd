@@ -1,0 +1,356 @@
+---
+title: "wgcna_combined"
+format: html
+---
+
+==================================================================
+
+# hdWGCNA for trisomy data
+
+Author: Carlo Zanetti
+
+This script performs hdWGCNA to construct gene co-expression networks. Aggregates cells into metacells to overcome the sparisty of single cell. Follows this tutorial: <https://smorabit.github.io/hdWGCNA/articles/basic_tutorial.html>
+
+## Workflow overview
+
+1.  Loading in data: Load libraries, seurat object and select expressed genes (\>5% of cells).
+2.  Metacell Construction:
+    -   Aggregates k-Nearest Neighbors (k=25) into dense "metacells".
+    -   Crucial for robust correlation calculation
+3.  Network parameter selection
+4.  Network Construction:
+    -   Soft Power Selection: Finds the threshold for a scale-free network.
+    -   Topological Overlap Matrix (TOM): Clusters genes into co-expression modules.
+5.  Module Eigengenes (MEs):
+    -   Calculates a summary score for each module per cell.
+    -   Applies Harmony to correct MEs for batch effects (hMEs).
+6.  Visualization & Biological Annotation:
+    -   Radar plots of module activity.
+    -   GO Enrichment (Enrichr) to determine module function.
+7.  Network visualisation - connectivity plot
+8.  Module enrichment - enrichR
+9.  Saving final object
+
+==================================================================
+
+```{r}
+rm(list = ls())
+```
+
+```{r setup, include=FALSE}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(WGCNA)
+library(hdWGCNA)
+library(cowplot)
+library(patchwork)
+library(qs2)
+library(igraph)
+library(magrittr)
+library(glue)
+library(enrichR)
+library(GeneOverlap)
+
+disableWGCNAThreads()
+
+theme_set(theme_cowplot())
+
+set.seed(42)
+
+WGCNA::allowWGCNAThreads(nThreads = 2) 
+setwd("/nemo/lab/destrooperb/home/shared/zanettc/emily_transcriptomics")
+```
+
+## File set-up
+
+```{r}
+run_num <- "run6"
+out_dir <- file.path("output", "jan_data", run_num, "wgcna")
+graphs_dir <- file.path(out_dir, "graphs")
+objects_dir <- file.path(out_dir, "objects")
+wgcna_name <- "emily_jan_run6"
+
+dir.create(graphs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 1. Loading in data
+
+```{r}
+
+labelled_path <- glue("output/jan_data/{run_num}/objects/prelabelled_integrated_rpca.qs2")
+seurat_obj <- qs_read(labelled_path)
+View(seurat_obj@meta.data)
+```
+
+## Ensure ID columns are factors for downstream grouping
+
+```{r}
+seurat_obj$cluster_id <- factor(Idents(seurat_obj))
+seurat_obj$sample_id <- factor(seurat_obj$orig.ident)
+```
+
+## Plot to check clusters are correct before starting
+
+```{r}
+p <- DimPlot(seurat_obj, group.by='cluster_id', label=TRUE) +
+   umap_theme() + ggtitle('') + NoLegend()
+
+p
+```
+
+## hdWGCNA works on normalised RNA counts
+
+```{r}
+seurat_obj[["RNA"]] <- CreateAssayObject(counts = seurat_obj[["SCT"]]@counts)
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- NormalizeData(seurat_obj)
+```
+
+## Gene selection (\>5% of cells)
+
+```{r}
+seurat_obj <- SetupForWGCNA(
+  seurat_obj,
+  gene_select = "fraction", # the gene selection approach
+  fraction = 0.05, # fraction of cells that a gene needs to be expressed in order to be included
+  wgcna_name = wgcna_name
+)
+```
+
+# 2. Meta cell construction
+
+Group by sample so metacells are created from same sample of origin
+
+```{r}
+seurat_obj <- MetacellsByGroups(
+  seurat_obj = seurat_obj,
+  group.by = "sample_id", # specify the columns in seurat_obj@meta.data to group by
+  reduction = 'umap.rpca', # select the dimensionality reduction to perform KNN on
+  k = 25, # nearest-neighbors parameter
+  max_shared = 10, # maximum number of shared cells between two metacells
+  ident.group = 'sample_id' # set the Idents of the metacell seurat object
+  )
+Idents(seurat_obj) <- "microglia"
+seurat_obj <- NormalizeMetacells(seurat_obj)
+```
+
+# 3. Network parameter selection
+
+WGCNA requires a soft power threshold to ensure the gene network has a scale-free topology.
+
+SFT -\> most genes have few connections, while a few hubs have many.
+
+```{r}
+seurat_obj <- SetDatExpr(
+  seurat_obj, assay = "RNA")
+```
+
+```{r}
+seurat_obj <- TestSoftPowers(
+  seurat_obj,
+  networkType = 'signed' # you can also use "unsigned" or "signed hybrid"
+)
+```
+
+```{r}
+plot_list <- PlotSoftPowers(seurat_obj)
+
+combined_soft <- wrap_plots(plot_list, ncol = 2)
+
+print(combined_soft)
+# Save high-resolution PDF
+ggsave(
+  filename = file.path(graphs_dir,"soft_power_selection.pdf"),
+  plot = combined_soft,
+  width = 12,       # increase width if labels overlap
+  height = 7,       # increase height for more clarity
+)
+```
+
+```{r}
+power_table <- GetPowerTable(seurat_obj)
+head(power_table)
+```
+
+# 4. Network construction
+
+Builds correlation matrix using metacells. Uses dendrogram to cluster genes into modules.
+
+```{r}
+seurat_obj <- ConstructNetwork(
+  seurat_obj,
+  tom_name = wgcna_name, # name of the topoligical overlap matrix written to disk
+  tom_outdir = objects_dir,
+  overwrite_tom = TRUE
+)
+```
+
+Plots dendrogram showing gene clustering
+
+```{r}
+pdf(file.path(graphs_dir,"dendrogram.pdf"), width = 12, height = 7)
+PlotDendrogram(seurat_obj, main='hdWGCNA Dendrogram')
+dev.off()
+```
+
+# 5. hME generation.
+
+Harmony batch correction to the MEs - gives harmonised module eigengenes.
+
+Calculate the ME which acts as a representative expression profile for the whole module. Due to multiple sequencing pools -\> Harmony batch correction to these scores.
+
+```{r}
+seurat_obj <- ScaleData(seurat_obj, features=VariableFeatures(seurat_obj))
+
+
+seurat_obj <- ModuleEigengenes(
+ seurat_obj,
+ group.by.vars="pool_id"
+)
+
+hMEs <- GetMEs(seurat_obj)
+```
+
+## Module connectivity
+
+How strongly each gene correlates with its module eigengene - high kME = hub gene.
+
+```{r}
+seurat_obj <- ModuleConnectivity(
+  seurat_obj
+)
+
+p <- PlotKMEs(seurat_obj, ncol=5)
+
+p
+
+ggsave(
+   filename = file.path(graphs_dir,"KMEs.pdf"),
+   plot = p,
+   width = 12,       # increase width if labels overlap
+   height = 7,       # increase height for more clarity
+)
+```
+
+```{r}
+hub_df <- GetHubGenes(seurat_obj, n_hubs = 10)
+
+head(hub_df)
+```
+
+# 6. Visualisation
+
+## UMAP plots
+
+```{r}
+#UMAP visualisation - colour cells by their ME score 
+plot_list <- ModuleFeaturePlot(
+  seurat_obj,
+  features='hMEs', # plot the hMEs
+  order=TRUE, # order so the points with highest hMEs are on top
+  reduction = "umap.rpca"
+)
+p <- wrap_plots(plot_list, ncol=4)
+p
+ggsave(
+  filename = file.path(graphs_dir,"umap_modules.pdf"),
+  plot = p,
+  width = 18,       # try 18–20 for 3 columns
+  height = 18
+)
+```
+
+## Radar plots
+
+```{r,fig.width=14, fig.height=8}
+
+plots <- ModuleRadarPlot(
+  seurat_obj,
+  group.by = "cluster_id",
+  barcodes = rownames(seurat_obj@meta.data),
+  axis.label.size = 3,
+  grid.label.size = 3
+)
+
+plots <- lapply(
+  plots,
+  \(p) p +
+    coord_cartesian(clip = "off") +                     # allow text outside circle
+    theme(
+      plot.margin = margin(25, 25, 25, 25),             # more whitespace
+      axis.text.x = element_text(size = 9, vjust = 1),  # tweak label placement
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank()
+    )
+)
+
+combined <- wrap_plots(plots, ncol = 3)
+combined
+
+# Save high-resolution image with expanded margins
+ggsave(
+  filename = file.path(graphs_dir,"module_radarplot.pdf"),
+  plot = combined,
+  width = 18,       # try 18–20 for 3 columns
+  height = 12
+)
+```
+
+## Add modules to metadata
+
+```{r}
+MEs <- GetMEs(seurat_obj, harmonized=TRUE)
+modules <- GetModules(seurat_obj)
+mods <- levels(modules$module); mods <- mods[mods != 'grey']
+
+#add MEs to metadata
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, MEs)
+```
+
+```{r}
+qs_save(seurat_obj, file.path(objects_dir, "seurat_obj_checkpoint.qs2"))
+```
+
+# 7. Network visualisation
+
+```{r}
+ModuleNetworkPlot(
+  seurat_obj,
+  outdir = file.path(graphs_dir,'ModuleNetworks')
+)
+```
+
+# 8. Module enrichment (enrichR)
+
+```{r}
+dbs <- c('GO_Biological_Process_2025','GO_Cellular_Component_2025','GO_Molecular_Function_2025')
+
+# perform enrichment tests
+seurat_obj <- RunEnrichr(
+  seurat_obj,
+  dbs=dbs,
+  max_genes = 100 # use max_genes = Inf to choose all genes
+)
+
+# retrieve the output table
+enrich_df <- GetEnrichrTable(seurat_obj)
+
+# look at the results
+head(enrich_df)
+
+EnrichrBarPlot(
+  seurat_obj,
+  outdir = file.path(graphs_dir,"enrichr_plots"), # name of output directory
+  n_terms = 10, # number of enriched terms to show (sometimes more are shown if there are ties)
+  plot_size = c(5,7), # width, height of the output .pdfs
+  logscale=TRUE # do you want to show the enrichment as a log scale?
+)
+```
+
+# 9. Saving final WGCNA object
+
+```{r}
+qs_save(seurat_obj, file.path(objects_dir, "seurat_wgcna_basic.qs2"))
+```

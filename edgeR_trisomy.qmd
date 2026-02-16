@@ -1,0 +1,673 @@
+---
+title: "edgeR"
+format: html
+editor: visual
+---
+
+# Pseudobulk Differential Gene Expression (edgeR) for Trisomy
+
+Author: Carlo Zanetti
+
+This script performs differential expression analysis on scRNA-seq data by aggregating cells into "pseudobulk" samples. This allows for statistical testing using edgeR's quasi-likelihood framework, treating biological replicates (mice) as the unit of replication rather than individual cells.
+
+## Workflow overview
+
+1\. Data Preparation: Convert Seurat object to SingleCellExperiment (SCE).
+
+2\. Pseudobulking: Aggregate counts by Sample ID (summing counts across cells).
+
+3\. Filtering & Normalization: Remove lowly expressed genes and normalize using TMM.
+
+4\. QC: PCA and MDS plots to visualize batch effects and sample grouping.
+
+5\. Statistical Modeling: Estimate dispersion and fit GLM (Quasi-Likelihood).
+
+6\. Hypothesis Testing: Run contrasts (Genotype vs. Condition) to find DEGs.
+
+7\. Visualization: Generate Volcano plots, MA plots, and Concordance plots. =================================================================
+
+```{r}
+rm(list=ls())
+```
+
+## Load libraries
+
+```{r}
+setwd("~/home/shared/zanettc/emily_transcriptomics")
+library(SingleCellExperiment)
+library(edgeR)
+library(limma)
+library(scuttle)
+library(Seurat)
+library(qs2)
+library(ggrepel)
+library(ggplot2)
+library(stringr)
+library(glue)
+library(dplyr)
+library(msigdbr)
+library(fgsea)
+library(viridis)
+
+```
+
+## Set directories
+
+```{r}
+run_num <- "run7"
+out_dir <- file.path("output", "jan_data", run_num, "edgeR")
+graphs_dir <- file.path(out_dir, "graphs", "filtered")
+objects_dir <- file.path(out_dir, "objects", "filtered")
+
+dir.create(graphs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Read in Seurat object
+
+```{r}
+seurat <- qs_read(glue("output/jan_data/run6/objects/prelabelled_integrated_rpca.qs2"))
+```
+
+## Convert to SCE object
+
+```{r}
+counts <- Seurat::GetAssayData(seurat, assay="SCT", layer="counts")
+sce <- SingleCellExperiment(assays=list(counts=counts))
+md <- seurat@meta.data
+md$cluster_id <- factor(as.character(Idents(seurat)))
+md$sample_id <- factor(md$orig.ident)
+colData(sce) <- DataFrame(md)
+```
+
+## Filtering out questionable sample - not necessary. 
+
+```{r}
+# seurat_filtered <- subset(seurat, subset = orig.ident != "BDAE50.1E")
+# 
+# counts <- Seurat::GetAssayData(seurat_filtered, assay="SCT", layer="counts")
+# md <- seurat_filtered@meta.data
+# 
+# sce <- SingleCellExperiment(assays = list(counts = counts))
+# 
+# md$cluster_id <- factor(as.character(Idents(seurat_filtered)))
+# md$sample_id <- factor(md$orig.ident)
+# colData(sce) <- DataFrame(md)
+```
+
+## Filter out lowly expressed genes across all cells
+
+Ensures results won't be skewed. Also gets rid of need for alternative pre-processing filtering steps.
+
+```{r}
+detect_rate <- rowMeans(counts(sce) > 0)
+#Gene must be expressed in > 2% of cells
+threshold <- 0.02
+genes_to_keep <- detect_rate > threshold
+sce_filtered <- sce[genes_to_keep, ]
+
+print(paste("Original genes:", nrow(sce)))
+print(paste("Genes kept (>2% expression):", nrow(sce_filtered)))
+```
+
+## Aggregates counts by celltypes and sample - pseudobulking step
+
+Treats mouse as biological replicate
+
+```{r}
+summed <- aggregateAcrossCells(
+  sce_filtered,
+  id = colData(sce_filtered)[, c("sample_id")]  # two-way grouping
+)
+```
+
+## Make DGE list
+
+Create edgeR container.
+
+```{r}
+#Make DGE list
+y <- DGEList(counts(summed), samples=colData(summed))
+
+#calculate normlisation factors: Correct for composition biases by computing normalisation factors with the TMM method
+
+#This function looks at columns of the count matrix (individual samples). Calculates a scaling factor for each specific column so that each sample can be compared. 
+
+y <- calcNormFactors(y)
+y$samples
+
+```
+
+# 4. QC (PCA and MDS)
+
+Visualise samples to ensure biological groups separate well and identify any confounding batch effects.
+
+## PCA plot
+
+```{r}
+logcpm <- cpm(y, log = TRUE, prior.count = 1)
+
+logcpm_corrected <- removeBatchEffect(
+  logcpm,
+  batch = y$samples$pool_id,
+  design = model.matrix(~ group_id, y$samples)
+)
+
+# PCA on samples (pseudobulk)
+pca <- prcomp(t(logcpm_corrected), scale. = TRUE)
+
+# % variance explained
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+var_expl
+# group factor (use your group_id)
+group <- factor(y$samples$group_id)
+group
+# colours per group
+col_by_group <- setNames(rainbow(length(levels(group))), levels(group))
+
+#labels
+sample_labels <- colnames(logcpm_corrected)
+sample_labels
+
+#PLOT PAIRWISE PCS ACROSS MULTIPLE DIMENSIONS
+npc <- min(6, ncol(pca$x))  # first 6 PCs or fewer if have less
+
+pdf(file.path(graphs_dir, "PCA_pairwise_PC1toPC6_by_group_batch_corrected.pdf"), width = 8, height = 6)
+
+for (i in 1:(npc - 1)) {
+  for (j in (i + 1):npc) {
+    
+    plot(
+      x = pca$x[, i],
+      y = pca$x[, j],
+      type = "n",
+      xlab = paste0("PC", i, " (", round(var_expl[i], 1), "%)"),
+      ylab = paste0("PC", j, " (", round(var_expl[j], 1), "%)"),
+      main = paste0("PC", i, " vs PC", j)
+    )
+    # add text labels instead of points
+    text(
+      x = pca$x[, i],
+      y = pca$x[, j],
+      labels = sample_labels,
+      col = col_by_group[group],
+      cex = 0.7   # shrink if cluttered
+    )
+    
+    legend("topright",
+           legend = levels(group),
+           col = col_by_group[levels(group)],
+           pch = 16,
+           bty = "n")
+  }
+}
+
+dev.off()
+```
+
+## MD plots to check variance
+
+Mean difference / MA plots.
+
+Checks for cloud of points to be surrounding zero
+
+Will be slightly trumpet shaped. Low count genes have larger variance.
+
+```{r}
+par(mfrow=c(1,1))
+for (i in seq_len(ncol(y))) {
+  plotMD(y, column=i)
+}
+```
+
+### MDS plots
+
+```{r}
+group <- factor(y$samples$group_id)
+pool <- factor(y$samples$pool_id)
+# Create the new column by searching for 'EXP1' or 'EXP2'
+season <- factor(str_extract(y$samples$processing_batch, "EXP1|EXP2"))
+
+
+cols_group <- setNames(c("red","green","blue", "orange"), levels(group))
+cols_season <- setNames(c("pink","darkgreen"), levels(season))
+cols_pool <- setNames(c("pink","darkgreen", "red","green","blue", "orange"), levels(pool))
+
+
+#MDS PLOTS
+
+pdf(file.path(graphs_dir, "MDS_plot_season.pdf"), width = 8, height = 6)
+plotMDS(cpm(y, log=TRUE), col = cols_season[season])
+legend("center", legend = levels(season), col = cols_season, pch = 16, bty = "n")
+dev.off()
+
+pdf(file.path(graphs_dir, "MDS_plot_pool.pdf"), width = 8, height = 6)
+plotMDS(cpm(y, log=TRUE), col = cols_pool[pool])
+legend("center", legend = levels(pool), col = cols_pool, pch = 16, bty = "n")
+dev.off()
+
+pdf(file.path(graphs_dir, "MDS_plot_condition.pdf"), width = 8, height = 6)
+plotMDS(cpm(y, log=TRUE), col = cols_group[group])
+legend("center", legend = levels(group), col = cols_group, pch = 16, bty = "n")
+dev.off()
+```
+
+# 4. Statistical modelling (GLM)
+
+## Create design matrix 
+
+Include pool in deisgn to control batch effects
+
+```{r}
+#batch effects
+design <- model.matrix(~0 + group + pool,  y$samples)
+design
+#clean up column names so easier to type
+colnames(design) <- gsub("group", "", colnames(design))
+colnames(design) <- make.names(colnames(design))
+design
+```
+
+## Estimate negative binomial dispersion
+
+Models the mean-variance relationship of counts - need this before any GLM fitting
+
+```{r}
+y <- estimateDisp(y, design)
+summary(y$trended.dispersion)
+summary(y$tagwise.dispersion)
+
+#Assess whether mean-variance relationship looks plausible:
+#1. High BCV at low abundance -> decreasing as mean expression rises - 
+  #variance stabilises for well-expressed genes
+#2. Most points should cluster around the blue line - 
+  #means fitted line describes data well
+#3 Vertical spread reflects biological variability between genes
+  #moderate spread expected. Huge scatter -> residual batch / tech variation
+  #too tight (all on line) implies too few replicates/ over-shrinkage
+#4 lower BCV means less unexplained variability,
+  #normally good but only within reason. if too low - maybe overshrinkage
+#these values are quite small, but likely due to 1000s of cells
+
+plotBCV(y)
+```
+
+## Estimate quasi-likelihood dispersion
+
+```{r}
+#fits GLM to counts for each gene
+#estimates the QL dispersion from the GLM deviance 
+#robust = TRUE to avoid distoritions from highly variable clusters
+fit <- glmQLFit(y, design, robust=TRUE)
+summary(fit$var.prior)
+summary(fit$df.prior)
+plotQLDisp(fit)
+```
+
+# 5. Differential expression testing
+
+Define specific contrasts and run statsitical tests
+
+```{r}
+L <- makeContrasts(
+  # NLGF comparison (A vs B within the NLGF genotype)
+  NLGF_A_vs_B = NLGF_A - NLGF_B,
+  
+  # hAPP comparison (A vs B within the hAPP genotype)
+  hAPP_A_vs_B = hAPP_A - hAPP_B,
+  
+  # A comparison (NLGF vs hAPP within condition A)
+  A_NLGF_vs_hAPP = NLGF_A - hAPP_A,
+  
+  # B comparison (NLGF vs hAPP within condition B)
+  B_NLGF_vs_hAPP = NLGF_B - hAPP_B,
+  
+  # Interaction (Does the difference between A and B change between genotypes?)
+  Interaction = (NLGF_A - NLGF_B) - (hAPP_A - hAPP_B),
+  
+  levels = design
+)
+
+contrast_names <- colnames(L)
+
+# Loop through each contrast, run the test, and save the file
+for (con in contrast_names) {
+  
+  # Perform the Quasi-Likelihood F-test
+  res <- glmQLFTest(fit, contrast = L[, con])
+  
+  # Extract the full table of results
+  res_table <- topTags(res, n = Inf)$table
+  
+  # Construct a filename based on the contrast name
+  file_path <- file.path(objects_dir, glue("{con}.csv"))
+  
+  # Save the CSV
+  write.csv(res_table, file = file_path, row.names = TRUE)
+  
+  # Print a status message so you know it's working
+  cat("Finished and saved:", file_path, "\n")
+}
+```
+
+# Visualisation
+
+#### Read in and tidy data
+
+```{r}
+tab_nlgf <- read.csv(file.path(objects_dir, "NLGF_A_vs_B.csv"))
+tab_happ <- read.csv(file.path(objects_dir, "hAPP_A_vs_B.csv"))
+tab_a <- read.csv(file.path(objects_dir, "A_NLGF_vs_hAPP.csv"))
+tab_b <- read.csv(file.path(objects_dir, "B_NLGF_vs_hAPP.csv"))
+tab_interaction <- read.csv(file.path(objects_dir, "Interaction.csv"))
+```
+
+## Create merged object
+
+```{r}
+merged_res <- inner_join(
+  tab_nlgf %>% dplyr::select(X, logFC_NLGF = logFC, FDR_NLGF = FDR),
+  tab_happ %>% dplyr::select(X, logFC_hAPP = logFC, FDR_hAPP = FDR),
+  by = "X"
+)
+merged_res
+
+fdr_cutoff <- 0.05
+
+merged_res <- merged_res %>%
+  mutate(
+    Significance = case_when(
+      FDR_NLGF < fdr_cutoff & FDR_hAPP < fdr_cutoff ~ "Both Significant",
+      FDR_NLGF < fdr_cutoff ~ "NLGF Only",
+      FDR_hAPP < fdr_cutoff ~ "hAPP Only",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+genes_to_label <- merged_res %>%
+  dplyr::filter(Significance != "Not Significant") #%>%
+  # Simple heuristic: Pick genes with high absolute LogFC in either condition
+  #filter(abs(logFC_NLGF) > 1 | abs(logFC_hAPP) > 1)
+
+
+sig_colors <- c(
+  "Both Significant" = "#009E73",  # Green
+  "NLGF Only"        = "#D55E00",  # Red/Orange
+  "hAPP Only"        = "#CC79A7",  # Purple
+  "Not Significant"  = "grey90"
+)
+
+
+shared_genes <- merged_res %>%
+  dplyr::filter(Significance == "Both Significant") %>%
+  # 2. Ensure they go in the same direction (Discordant genes are excluded)
+  dplyr::filter(sign(logFC_NLGF) == sign(logFC_hAPP)) %>%
+  # 3. Create a clean "Direction" column
+  mutate(Direction = ifelse(logFC_NLGF > 0, "Shared Upregulated", "Shared Downregulated")) %>%
+  # 4. Sort by the average magnitude of change (descending)
+  mutate(Avg_Abs_LogFC = (abs(logFC_NLGF) + abs(logFC_hAPP)) / 2) %>%
+  arrange(desc(Avg_Abs_LogFC)) %>%
+  # Select only relevant columns for the final table
+  dplyr::select(X, Direction, logFC_NLGF, FDR_NLGF, logFC_hAPP, FDR_hAPP)
+
+
+# --- View the breakdown ---
+shared_genes %>% 
+  dplyr::filter(Direction == "Shared Upregulated") %>%
+  arrange(desc(logFC_NLGF))
+
+```
+
+## Concordance plot
+
+```{r}
+genes_to_label <- merged_res %>%
+  dplyr::filter(Significance != "Not Significant") %>%
+  # Strategy: Filter by "Distance from Origin" (High magnitude in both or one)
+  mutate(dist = sqrt(logFC_NLGF^2 + logFC_hAPP^2)) %>%
+  slice_max(order_by = dist, n = 30) # Only label top 30 most extreme genes
+
+# --- STEP 2: The Plot ---
+p <- ggplot(merged_res, aes(x = logFC_NLGF, y = logFC_hAPP)) +
+  
+  # 1. Diagonal and Axes
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "solid", linewidth = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  
+  # 2. Scatter Points
+  geom_point(aes(color = Significance), alpha = 0.6, size = 2) + # Slightly larger points
+  
+  # 3. Optimized Labels
+  geom_label_repel(
+    data = genes_to_label, 
+    aes(label = X, color = Significance),
+    size = 4,                  # Increase label text size (default is roughly 3.8)
+    fontface = "bold",         # Make labels pop
+    box.padding = 0.5,         # Space around the text box
+    point.padding = 0.3,       # Space between point and label connector
+    force = 2,                 # Repulsion force (higher = push labels further apart)
+    max.overlaps = Inf,        # Allow all selected labels to show (since we filtered to 30)
+    min.segment.length = 0,    # Always draw a line to the point
+    show.legend = FALSE,
+    fill = "white"
+  ) +
+  
+  # 4. Styling
+  scale_color_manual(values = sig_colors) +
+  coord_fixed() + 
+  
+  # Increase base_size to make ALL text (axes, titles) larger automatically
+  theme_bw(base_size = 16) + 
+  
+  labs(
+    title = "Comparison of Differential Expression (A vs B)",
+    subtitle = "Concordance between NLGF and hAPP models",
+    x = "Log2 Fold Change (NLGF)",
+    y = "Log2 Fold Change (hAPP)",
+    color = "Significance (FDR < 0.05)"
+  ) +
+  
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size=16),
+    legend.title = element_text(size = 16, face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 18),
+    axis.title = element_text(face = "bold")
+  ) + 
+  guides(color = guide_legend(
+    override.aes = list(size = 5), 
+    nrow=2
+    ))
+ggsave(
+  filename = file.path(graphs_dir, "concordance_NLGF_and_hAPP_A_vs_B_fixed.pdf"),
+  plot = p,
+  width = 10,
+  height = 10,
+  dpi = 300
+)
+```
+
+## MA plot definition
+
+```{r}
+generate_ma_plot <- function(data, name) {
+  
+  message(paste("Generating MA Plot for:", name))
+  
+  # --- Data Processing (Must match Volcano logic) ---
+  plot_data <- data %>%
+    mutate(
+      Status = case_when(
+        FDR < 0.05 & logFC > 0.5 ~ "Upregulated",
+        FDR < 0.05 & logFC < -0.5 ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    ) %>%
+    group_by(Status) %>%
+    
+    
+    group_by(Status) %>%
+    mutate(GroupRank = rank(-logCPM)) %>% 
+    ungroup() %>%
+    mutate(
+      Label = case_when(
+        Status != "Not Significant" & GroupRank <= 20 ~ X, 
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # --- Plotting ---
+  p <- ggplot(plot_data, aes(x = logCPM, y = logFC, fill = Status, color = Status)) + 
+    geom_point(aes(size = Status, alpha = Status), shape = 21, stroke = 0.2) +
+    
+    # Consistent Coloring
+    scale_fill_manual(values = c("Upregulated" = "#e41a1c", "Downregulated" = "#377eb8", "Not Significant" = "grey80")) +
+    scale_color_manual(values = c("Upregulated"="black", "Downregulated"="black", "Not Significant"="grey90")) +
+    scale_size_manual(values = c("Upregulated"=3, "Downregulated"=3, "Not Significant"=1.5)) +
+    scale_alpha_manual(values = c("Upregulated"=1, "Downregulated"=1, "Not Significant"=0.3)) +
+    
+    # Lines
+    geom_hline(yintercept = 0, color = "black", size = 0.5) + # Reference at 0
+    geom_hline(yintercept = c(-0.5, 0.5), linetype = "dashed", color = "grey30") +
+    
+    # Labels
+    geom_label_repel(aes(label = Label), fill="white", color="black", fontface="bold", 
+                     size=3.5, min.segment.length=0, max.overlaps=50) +
+    
+    labs(
+      title = paste0("MA Plot: ", name),
+      subtitle = "Log CPM vs Log Fold Change",
+      x = "Log CPM", 
+      y = bquote(bold("Log"[2] ~ "Fold Change"))
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "top", 
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+  
+  # --- Saving ---
+  safe_name <- gsub(" ", "_", name)
+  ggsave(filename = file.path(graphs_dir, paste0("MA_Plot_", safe_name, ".pdf")), 
+         plot = p, width = 10, height = 7, dpi = 300, device = cairo_pdf)
+}
+```
+
+## Volcano and MA plots
+
+```{r}
+#Define colours for the volcano 
+volcano_cols <- c("Upregulated" = "#e41a1c", 
+                  "Downregulated" = "#377eb8", 
+                  "Not Significant" = "grey80")
+
+
+
+
+#Define volcano generating function
+generate_volcano <- function(data, name) {
+  
+  message(paste("Generating plot for:", name))
+  
+  # --- Data Processing ---
+  volcano_data <- data %>%
+    mutate(
+      # Define significance categories
+      Status = case_when(
+        FDR < 0.05 & logFC > 0.5 ~ "Upregulated",
+        FDR < 0.05 & logFC < -0.5 ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    ) %>%
+    # Group by Status to rank Upregulated and Downregulated separately
+    group_by(Status) %>%
+    # Rank by FDR (smallest FDR = 1)
+    mutate(GroupRank = rank(FDR)) %>%
+    ungroup() %>%
+    mutate(
+      #label in top 20 for each category
+      Label = case_when(
+       #X is gene column name
+        Status != "Not Significant" & GroupRank <= 20 ~ X, 
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # --- Plotting ---
+  p <- ggplot(volcano_data, aes(x = logFC, y = -log10(FDR), fill = Status, color = Status)) +
+    
+    # Points
+    geom_point(aes(size = Status, alpha = Status), shape = 21, stroke = 0.2) +
+    
+    # Scales
+    scale_fill_manual(values = volcano_cols) +
+    scale_color_manual(values = c("Upregulated" = "black", "Downregulated" = "black", "Not Significant" = "grey90")) +
+    scale_size_manual(values = c("Upregulated" = 3, "Downregulated" = 3, "Not Significant" = 1.5)) +
+    scale_alpha_manual(values = c("Upregulated" = 1, "Downregulated" = 1, "Not Significant" = 0.3)) +
+    
+    # Threshold Lines
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey30", size = 0.8) +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "grey30", size = 0.8) +
+    
+    # Labels
+    geom_label_repel(
+      aes(label = Label),
+      fill = "white", color = "black", fontface = "bold", size = 3.5,
+      box.padding = 0.5, point.padding = 0.5,
+      min.segment.length = 0, segment.color = "grey50", max.overlaps = 50
+    ) +
+    
+    # Dynamic Titles
+    labs(
+      title = paste0("Differential Expression: ", name), # Dynamic Title
+      subtitle = "Top 20 Genes Labeled | FDR < 0.05 | logFC cutoff: 0.5",
+      x = bquote(bold("Log"[2] ~ "Fold Change")),
+      y = bquote(bold("-Log"[10] ~ "FDR"))
+    ) +
+    
+    # Theme
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 18, hjust = 0),
+      plot.subtitle = element_text(size = 12, color = "grey40", margin = margin(b = 10)),
+      axis.title = element_text(face = "bold", size = 14),
+      axis.text = element_text(face = "bold", color = "black"),
+      axis.line = element_line(color = "black", linewidth = 1),
+      axis.ticks = element_line(color = "black", linewidth = 1),
+      legend.position = "top",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 12, face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey95")
+    )
+  
+  safe_name <- gsub(" ", "_", name)
+  
+  ggsave(
+    filename = file.path(graphs_dir, paste0("Volcano_", safe_name, "_Swanky.pdf")), 
+    plot = p, 
+    width = 10, height = 7, dpi = 300,
+    device = cairo_pdf 
+  )
+}
+
+all_comparisons <- list(
+  "hAPP (A vs B)" = tab_happ,
+  "NLGF (A vs B)"    = tab_nlgf, # Replace with your actual table names
+  "A (NLGF vs hAPP)"    = tab_a,
+  "B (NLGF vs hAPP)" = tab_b
+)
+
+#Iterate through the list using the function
+for (name in names(all_comparisons)) {
+  
+  current_data <- all_comparisons[[name]]
+  generate_volcano(current_data, name)
+  
+  generate_ma_plot(current_data,name)
+  
+}
+```

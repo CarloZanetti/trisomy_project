@@ -1,0 +1,176 @@
+---
+title: "emily_ME_stats"
+output: html_document
+date: "2025-11-20"
+---
+
+==================================================================
+
+# WGCNA Module Eigengene (ME) Statistical Analysis 
+
+Author: Carlo Zanetti
+
+This script takes the co-expression modules identified by hdWGCNA and performs statistical testing to see if they are differentially expressed between experimental conditions.
+
+WORKFLOW OVERVIEW:
+
+1\. Data Loading: Imports the Seurat object containing WGCNA results.
+
+2\. Module Extraction: Retrieves Harmonized Module Eigengenes (hMEs) and Annotation: Renames color-based modules to biological names (e.g., "Ribosomal").
+
+3\. Pseudobulking: Aggregates single-cell ME scores into per-sample averages.
+
+4\. Visualization & Stats: Generates boxplots with ANOVA testing to compare module activity across groups ==================================================================
+
+```{r}
+rm(list = ls())
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DESeq2)
+library(tidyverse)
+library(hdWGCNA)
+library(cowplot)
+library(ggpubr)
+library(rstatix)
+library(glue)
+setwd("/nemo/lab/destrooperb/home/shared/zanettc/emily_transcriptomics")
+
+```
+
+## Load directories
+
+```{r}
+run_num <- "run7"
+out_dir <- file.path("output", "jan_data", run_num, "wgcna")
+graphs_dir <- file.path(out_dir, "graphs")
+objects_dir <- file.path(out_dir, "objects")
+wgcna_name <- glue("emily_jan_{run_num}")
+
+dir.create(graphs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 1. Data loading
+
+```{r}
+seurat_obj <- qs_read(glue("output/jan_data/{run_num}/wgcna/objects/seurat_wgcna_basic.qs2"))
+
+seurat_obj$group_id <- as.factor(seurat_obj@meta.data$group_id)
+```
+
+# 2. Module Extraction and annotation
+
+```{r}
+# 1. Get the MEs (This usually contains just the module numeric data)
+hMEs <- GetMEs(seurat_obj, harmonized=TRUE)
+
+# 2. Define your map
+module_name_mapping <- c(
+  "grey"      = "Unassigned",
+  "blue"      = "Blue: Ribosomal",
+  "turquoise" = "Turquoise: Motility",
+  "brown"     = "Brown: Cytokine Response",
+  "yellow"    = "Yellow: DAM/HLA",
+  "green"     = "Green: Homeostatic",
+  "black" = "Black: IRM",
+  "red" = "Red: Proliferative"
+  
+)
+
+# 3. Apply the renaming BEFORE adding metadata
+# We filter to ensure we only rename columns that exist in the map
+current_cols <- names(hMEs)
+valid_cols   <- current_cols[current_cols %in% names(module_name_mapping)]
+
+# Update the names
+names(hMEs)[names(hMEs) %in% valid_cols] <- module_name_mapping[valid_cols]
+
+# Check to ensure names are correct now
+print(head(hMEs))
+```
+
+## Replicate and condition for hMEs
+
+```{r}
+hMEs$sample_id <- seurat_obj@meta.data[rownames(hMEs), "sample_id"]
+hMEs$group_id <- seurat_obj@meta.data[rownames(hMEs), "group_id"]
+```
+
+# 3. Aggregate to calculate the mean ME values per sample
+
+Aggregate to calculate the mean ME values per sample.
+
+```{r}
+ME_sample <- hMEs %>%
+  group_by(sample_id, group_id) %>%
+  summarise(across(where(is.numeric), mean), .groups="drop") %>%
+  as.data.frame()
+
+# Clean up rownames
+rownames(ME_sample) <- ME_sample$sample_id
+
+print(ME_sample)
+write.csv(ME_sample, file.path(objects_dir,"mean_sample_hMEs.csv"))
+```
+
+# 4. Statistical testing and boxplots
+
+```{r}
+# Pivot data to long format for easy plotting with ggplot
+ME_long <- ME_sample %>%
+  pivot_longer(cols = -c(sample_id, group_id), names_to = "Module", values_to = "ME_Value")
+
+ME_long
+```
+
+```{r}
+pdf(file.path(graphs_dir,"Module_Expression_By_Group_Boxplots.pdf"), width=12, height=12)
+
+# We can use facet_wrap to show all modules at once
+p <- ggplot(ME_long, aes(x=group_id, y=ME_Value, fill=group_id)) +
+  geom_boxplot(outlier.shape = NA, alpha=0.7) +
+  geom_jitter(width=0.1, size=1.5) + # Shows your actual N=12 samples
+  facet_wrap(~Module, scales="free_y", ncol=4) +
+  theme_cowplot() +
+  stat_compare_means(method = "anova", label.y.npc = 0.9, size=3) + # Add ANOVA p-value
+  labs(title = "Module Eigengene Expression per Condition",
+       y = "Module Eigengene (Sample Mean)",
+       x = "Condition") +
+  theme(legend.position="top", axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+dev.off()
+```
+
+## Labelled boxplot
+
+Overlays sample labels for diagonsis
+
+```{r}
+pdf(file.path(graphs_dir,"Module_Expression_By_Group_Boxplots_lab_samples.pdf"), width=15, height=9)
+
+# We can use facet_wrap to show all modules at once
+p <- ggplot(ME_long, aes(x=group_id, y=ME_Value, fill=group_id)) +
+  geom_boxplot(outlier.shape = NA, alpha=0.7) +
+  geom_point(width=0.1, size=1.5) + 
+  geom_text_repel(
+    aes(label = sample_id),
+    position = position_jitter(width = 0.1, seed = 42), 
+    size = 2.5,
+    max.overlaps = 10
+  ) +
+  facet_wrap(~Module, scales="free_y", ncol=4) +
+  theme_cowplot() +
+  stat_compare_means(method = "anova", label.y.npc = 0.9, size=3) + # Add ANOVA p-value
+  labs(title = "Module Eigengene Expression per Condition",
+       y = "Module Eigengene (Sample Mean)",
+       x = "Condition") +
+  theme(legend.position="top", axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+dev.off()
+```
+
+Standard ANOVA is risky as assumes equal variance across groups. Kruskal wallis is safer but with n=4 could be too low power -\> type II error.

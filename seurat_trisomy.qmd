@@ -1,0 +1,1514 @@
+---
+title: "Seurat pipeline for Trisomy data"
+format: html
+---
+
+```{r}
+rm(list = ls())
+```
+
+==================================================================================================
+
+# Seurat analysis pipeline for trisomy dataset
+
+Author: Carlo Zanetti
+
+This script performs processing of 10x genomics scRNA-seq data derived from xenografted human microglia into mouse models.
+
+## Workflow overview:
+
+1.  **Data ingestion**: Loads cell ranger outputs and maps to metadata
+2.  **QC and filtering**:
+    -   Verifies file integrity
+    -   Separates human vs mouse cells based on gene prefixes
+    -   Checkpoint save - this is the first initial object
+    -   Labels multiplets (scDblFinder) and outliers (MAD score)
+3.  **Individual batch processing**
+    -   Useful QC per batch
+4.  **Normalisation** and **Integration** -
+    -   Merges sequencing pools
+    -   normalises using SCTransform v2
+    -   corrects batch effects using RPCA
+5.  **Clustering and annotations**
+    -   Generate UMAPs
+
+    -   Scores cells against curated Mancuso signatures
+
+    -   Assign biological labels to clusters (optional)
+6.  **Cluster markers**
+7.  **Identification and removal of specific clusters as needed**
+8.  **Editing of metadata due to mislabelling**
+
+====================================================================================================
+
+## Load libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/nemo/lab/destrooperb/home/shared/zanettc/emily_transcriptomics")
+library(dplyr)
+library(Matrix)
+library(Seurat)
+library(SeuratObject)
+library(tidyverse)
+library(glue)
+library(readxl)
+library(future)
+library(gridExtra)
+library(SoupX)
+#library(scDblFinder)
+library(SingleCellExperiment)
+library(qs2)
+library(glue)
+library(dplyr)
+```
+
+# 1. Data ingestion
+
+## Load directories - edit for each run
+
+```{r}
+demux_path <- "input/jan_raw/cellranger_output"
+
+nums <- c("1", "2", "3", "4", "5", "6") #pool numbers
+
+filtered_paths <- file.path(
+    unlist(lapply(
+      file.path(demux_path, glue("pool{nums}_out"), "outs", "per_sample_outs"),
+      list.dirs, recursive = FALSE, full.names = TRUE
+    )),
+    "count", "sample_filtered_feature_bc_matrix"
+  )
+
+raw_paths <- file.path(
+    unlist(lapply(
+      file.path(demux_path, glue("pool{nums}_out"), "outs", "per_sample_outs"),
+      list.dirs, recursive = FALSE, full.names = TRUE
+    )),
+    "count", "sample_raw_feature_bc_matrix"
+  )
+
+#setup output structure
+#change this run number as needed
+run_num <- "run6"
+
+out_dir <- file.path("output", "jan_data", run_num)
+graphs_dir <- file.path(out_dir, "graphs")
+objects_dir <- file.path(out_dir, "objects")
+
+dir.create(graphs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Read in metdata
+
+```{r}
+meta <- read_excel("input/meta/meta_data_combined.xlsx")
+```
+
+## Size check
+
+Checks if files exist
+
+```{r}
+expected <- c("matrix.mtx.gz", "features.tsv.gz", "barcodes.tsv.gz")
+
+check_files_by_path <- function(path) {
+  # Extract the Sample ID from the path for the table
+  sample_id <- basename(dirname(dirname(path))) 
+  # Extract the Lane (e.g., gem1_out) for extra safety
+  lane_folder <- basename(dirname(dirname(dirname(dirname(dirname(path))))))
+  
+  pool_number <- as.integer(gsub("\\D", "", lane_folder))
+  
+  files <- file.path(path, expected)
+  file_present <- file.exists(files)
+  sizes <- ifelse(file_present, file.info(files)$size, NA_real_)
+  
+  tibble(
+    pool_id = pool_number,
+    sample_hash = sample_id, 
+    file = expected, 
+    exists = file_present, 
+    size = sizes
+  )
+}
+
+results <- map_dfr(filtered_paths, check_files_by_path)
+
+results %>% tail(10)
+results
+
+```
+
+## Mapping Mouse IDs to sample IDs
+
+```{r}
+path_map <- results %>% 
+  select(pool_id, sample_hash) %>% 
+  distinct() %>%
+  mutate(filtered_path = filtered_paths,
+         raw_path = raw_paths)
+
+named_paths_tbl <- path_map %>% 
+  left_join(meta, by = c("sample_hash", "pool_id"))
+
+
+filtered_data_dirs <- named_paths_tbl %>%
+  #gets rid of blank NA column (Emma ran cellranger with B0255 as a tag)
+  filter(!is.na(mouse_id)) %>%
+  select(mouse_id, filtered_path) %>%
+  deframe()
+
+raw_data_dirs <- named_paths_tbl %>%
+  #get rid of blank NA column
+  filter(!is.na(mouse_id)) %>%
+  select(mouse_id, raw_path) %>%
+  deframe()
+
+```
+
+# 2. QC and filtering
+
+## Removal of failed samples
+
+These samples were removed due to poor cellranger QC metrics / high reported death from FACS from Emily.
+
+```{r}
+bad_samples <- c("BDAE56.1B", "BDAG185.1G", "BDAE50.1D")
+
+filter_samples <- function(data_dirs) {
+  #Keeps only samples not in bad list
+  data_dirs <- data_dirs[! names(data_dirs) %in% bad_samples]
+  #check removed
+  return(data_dirs)
+}
+filtered_data_dirs <- filter_samples(filtered_data_dirs)
+raw_data_dirs <- filter_samples(raw_data_dirs)
+print(filtered_data_dirs)
+length(filtered_data_dirs)
+```
+
+## Read 10x
+
+Note: Because last year's data has a different antibody (hash5), normal read10x loading crashes as all antibodies must match completely. This is an annoying workaround but works exactly the same.
+
+```{r}
+
+#Loading function
+make_seurat_object <- function(path, name) {
+  
+  data <- Read10X(data.dir = path)
+  rna_counts <- data$`Gene Expression`
+  adt_counts <- data$`Antibody Capture`
+  
+#create seurat object for each mouse, filtering out cells with lower than 200 genes. 
+  obj <- CreateSeuratObject(
+    counts = rna_counts, 
+    project = name, 
+    min.features = 200 
+  )
+  
+  return(obj)
+}
+
+# 2. Load samples into list
+seurat_list <- mapply(
+  FUN = make_seurat_object,
+  path = filtered_data_dirs,
+  name = names(filtered_data_dirs),
+  SIMPLIFY = FALSE
+)
+# 3. Merge into one seurat object
+#barcodes now have mouse_id name superceding the barcode - now all unique. 
+seurat_obj <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = names(filtered_data_dirs)
+)
+
+seurat_obj <- JoinLayers(seurat_obj)
+
+# 4. Attach Metadata
+seurat_obj@meta.data <- seurat_obj@meta.data %>%
+  rownames_to_column("cell") %>% 
+  left_join(meta, by = c("orig.ident" = "mouse_id")) %>%
+  column_to_rownames("cell")
+
+seurat_obj@meta.data$group_id <- paste(seurat_obj@meta.data$app_genotype, seurat_obj@meta.data$microglia, sep = "_")
+
+
+# 5. Apply Gene Filtering (min.cells) GLOBALLY
+# gets rid of genes with less than 3 cells expressing it.  
+counts <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+keep_genes <- Matrix::rowSums(counts > 0) >= 3
+seu <- subset(seurat_obj, features = names(which(keep_genes)))
+```
+
+## Filter for human cells and genes
+
+Selects cells which express \> 90 % human genes. Also selects only human genes.
+
+```{r}
+ids <- rownames(seu)
+
+#identify species prefix
+is_human <- grepl("^GRCh38", ids)
+is_mouse <- grepl("^GRCm39", ids)
+
+human_ids <- ids[is_human]
+mouse_ids <- ids[is_mouse]
+
+raw_mat <- GetAssayData(seu, layer = "counts")
+
+# Calculate the fraction of UMIs mapping to Human vs Mouse per cell
+human_counts <- Matrix::colSums(raw_mat[human_ids, , drop = FALSE])
+mouse_counts <- Matrix::colSums(raw_mat[mouse_ids, , drop = FALSE])
+total_counts <- Matrix::colSums(raw_mat)
+
+seu$human_frac <- ifelse(total_counts > 0, human_counts / total_counts, 0)
+seu$mouse_frac <- ifelse(total_counts > 0, mouse_counts / total_counts, 0)
+
+# Define 90% purity cutoffs
+human_cut <- 0.90
+mouse_cut <- 0.90
+seu$species_call <- dplyr::case_when(
+  seu$human_frac >= human_cut ~ "human",
+  seu$mouse_frac >= mouse_cut ~ "mouse",
+  TRUE ~ "mixed_or_ambiguous"
+)
+print(table(seu$species_call))
+
+
+#filter to only human cells
+filter_species <- function(seurat_obj, species = "human") {
+  #in case running this before species assignment
+  #keeps only cells where metadata column species_call is that of the species given. 
+  subset(seurat_obj, subset = species_call == species)
+}
+seu_h <- filter_species(seu, "human")
+
+#drop mouse genes from the features list
+mouse_prefix <- "^GRCm39-"
+keep_features <- rownames(seu_h)[!grepl(mouse_prefix, rownames(seu_h))]
+seu_h <- subset(seu_h, features = keep_features)
+
+#strip human genome prefix from remaining gene IDs for downstream analysis
+rownames(seu_h) <- sub("^GRCh38-", "", rownames(seu_h))
+
+
+#check no mouse genes
+dup <- any(duplicated(rownames(seu_h))); if (dup) warning("Duplicated gene IDs after renaming")
+
+```
+
+## Initial save
+
+This is the intial raw file.
+
+```{r}
+qs_save(seu_h, file.path(objects_dir, "seu_h_initial.qs2"))
+seu_h <- qs_read(file.path(objects_dir, "seu_h_initial.qs2"))
+```
+
+# Doublet detection using scDblFinder
+
+See <https://www.10xgenomics.com/support/universal-three-prime-gene-expression/documentation/steps/library-prep/chromium-gem-x-single-cell-3-v4-gene-expression-user-guide>
+
+Mutiplet rate is \~0.4% per 1000 cells as per the doc above. Set this as a parameter.
+
+By default this function assumes using old 10x chemistry.
+
+```{r}
+# Convert to SingleCellExperiment format required by scDblFinder
+sce <- as.SingleCellExperiment(seu_h)
+
+## Run doublet detection per sequencing pool
+#importantly, adjust expectation of no. doublets due to using v4 chemistry 
+#dbr.per1k defines slope of the doublet rate increase. For every 1000 cells you recover, add this much to the expected doublet percentage. 
+sce <- scDblFinder(sce, samples = "pool_id", dbr.per1k = 0.004)
+
+# Transfer scores back to Seurat metadata
+seu_h$scDblFinder.class <- sce$scDblFinder.class
+seu_h$scDblFinder.score <- sce$scDblFinder.score
+seu_h$scDblFinder.weighted <- sce$scDblFinder.weighted
+
+table(seu_h$pool_id, seu_h$scDblFinder.class)
+
+#checkpoint as takes a while to run
+qs_save(seu_h, file.path(objects_dir, "seu_h_scdbl.qs2"))
+```
+
+#### Histogram
+
+Shows distribution of scores across cells
+
+```{r}
+p <- ggplot(seu_h@meta.data, aes(x = scDblFinder.score, fill = scDblFinder.class)) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.6) +
+  scale_x_log10() + # Log scale helps visualize the separation better
+  theme_classic() +
+  labs(title = "Doublet Score Distribution",
+       subtitle = "Look for a valley between Singlets (Grey) \nand Doublets (Red)",
+       x = "scDblFinder Score (Log Scale)",
+       y = "Count") +
+  scale_fill_manual(values = c("singlet" = "grey", "doublet" = "red"))
+
+ggsave(file.path(graphs_dir, "QC_scdbl_hist.pdf"), plot = p, width = 12, height = 6, units = "in")
+```
+
+#### QC violin plot
+
+Violin plots split by scDblFinder class for mit%, nFeatures, nCounts
+
+```{r}
+seu_h[["percent.mt"]] <- PercentageFeatureSet(seu_h, pattern = "^MT-")
+
+p <- VlnPlot(
+  seu_h, 
+  features = c("nCount_RNA", "nFeature_RNA", "percent.mt"), 
+  group.by = "pool_id",           # X-axis will be Batches
+  split.by = "scDblFinder.class", # Violins will be split by Singlet/Doublet
+  pt.size = 0
+) + 
+  labs(fill = "Cell Class") +
+  theme(legend.position = "right")
+p
+ggsave(file.path(graphs_dir, "QC_scDbl_violin.pdf"), plot = p, width = 12, height = 6, units = "in")
+```
+
+#### Plots of counts vs mitochondrial % and counts vs features
+
+Without the scDblFinder class
+
+```{r}
+plot1 <- FeatureScatter(seu_h, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(seu_h, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+print(plot1)
+print(plot2)
+
+ggsave(file.path(graphs_dir, "QC_nCount_vs_mt.pdf"), plot = plot1, width = 12, height = 6, units = "in")
+
+ggsave(file.path(graphs_dir, "QC_nCount_vs_feature.pdf"), plot = plot2, width = 12, height = 6, units = "in")
+```
+
+## Counts vs features with scDblFinder assigment
+
+```{r}
+plot <- FeatureScatter(
+  seu_h, 
+  feature1 = "nCount_RNA", 
+  feature2 = "nFeature_RNA", 
+  group.by = "scDblFinder.class" # Replace with your actual column name
+) 
+
+ggsave(file.path(graphs_dir, "QC_nCount_vs_feature_doublets.pdf"), plot = plot, width = 12, height = 6, units = "in")
+```
+
+## Outlier detection (MAD scoring)
+
+Use Median absolute devidation rather than fixed cutoffs
+
+```{r}
+cols_to_fix <- c("median_count", "mad_count", "upper_limit_5_mad", "upper_limit_3_mad")
+seu_h@meta.data <- seu_h@meta.data[, !(names(seu_h@meta.data) %in% cols_to_fix)]
+
+qc_stats <- seu_h@meta.data %>%
+  group_by(pool_id) %>%
+  summarise(
+    median_count = median(nCount_RNA),
+    mad_count = mad(nCount_RNA)) %>%
+  mutate(
+    # The cutoff is the Median + 5 MADs (Standard robust outlier detection)
+    upper_limit_5_mad = median_count + (5 * mad_count),
+    upper_limit_3_mad = median_count + (3 * mad_count) 
+  )
+
+#flag cells as outliers based on calculated limits
+meta_updated <- seu_h@meta.data %>%
+  rownames_to_column("cell_id") %>%
+  left_join(qc_stats, by = "pool_id") %>%
+  mutate(mad5_outlier = ifelse(nCount_RNA >= upper_limit_5_mad, "Outlier", "Not Outlier"),
+         mad3_outlier = ifelse(nCount_RNA >= upper_limit_3_mad, "Outlier", "Not Outlier")) %>%
+  column_to_rownames("cell_id")
+
+
+seu_h@meta.data <- meta_updated
+
+table(seu_h$mad3_outlier, seu_h$group_id)
+
+VlnPlot(seu_h, features = "nCount_RNA", group.by = "pool_id", pt.size = 0.1) +
+  geom_hline(data = qc_stats, aes(yintercept = upper_limit), color = "red", linetype = "dashed")
+```
+
+#### Analysis of intersection between MAD cut-off and scDblFinder assignments
+
+Calculate number of cells and percent of cells that would be removed for each MAD cut-off (3 and 5% respectively)
+
+```{r}
+# define the doublet column name
+dbl_col <- "scDblFinder.class" 
+
+# Calculate global stats
+global_stats <- seu_h@meta.data %>%
+  summarise(
+    total_cells = n(),
+    # Count cells that are Outliers OR Doublets
+    n_remove_3 = sum(mad3_outlier == "Outlier" | .data[[dbl_col]] == "doublet"),
+    percent_remove_3 = round((n_remove_3 / total_cells) * 100, 2),
+    n_remove_5 = sum(mad5_outlier == "Outlier" | .data[[dbl_col]] == "doublet"),
+    percent_remove_5 = round((n_remove_5 / total_cells) * 100, 2)
+  )
+
+print(global_stats)
+
+```
+
+#### Table to check if the outliers are more often doublets
+
+```{r}
+table(Outlier_Status = seu_h$is_outlier, Doublet_Status = seu_h$scDblFinder.class)
+```
+
+#### Counts vs outlier check
+
+Check for how many cells have greater than 6000 features while also being classed as an outlier- used as a cursory check given I used to subset out \>6000 feature cells as a strict cut-off.
+
+```{r}
+outlier_summary <- seu_h@meta.data %>%
+  group_by(mad3_outlier, mad5_outlier) %>%
+  summarise(
+    Total_Cells = n(),
+    Cells_Over_6000_Features = sum(nFeature_RNA > 6000),
+    Percentage_High_Feature = round((Cells_Over_6000_Features / Total_Cells) * 100, 2),
+    .groups = "drop"
+  )
+
+print(outlier_summary)
+
+outlier_summary <- seu_h@meta.data %>%
+  group_by(mad3_outlier, mad5_outlier) %>%
+  summarise(
+    Total_Cells = n(),
+    Cells_Over_6000_Features = sum(nFeature_RNA > 6000),
+    Percentage_High_Feature = round((Cells_Over_6000_Features / Total_Cells) * 100, 2),
+    .groups = "drop"
+  ) %>%
+  select(mad3_outlier, mad5_outlier, Total_Cells, Percentage_High_Feature)
+
+print(outlier_summary)
+```
+
+```{r}
+# extract the nCount_RNA vector
+counts <- seu_h$nCount_RNA
+
+# 1. Calculate Statistics
+median_val <- median(counts)
+mad_val <- mad(counts)
+
+# Calculate the cutoffs
+cutoff_3mad <- median_val + (3 * mad_val)
+cutoff_5mad <- median_val + (5 * mad_val)
+
+# 2. Print the impact (Cells lost vs Kept)
+cat("Median UMI Count:", median_val, "\n")
+cat("MAD:", mad_val, "\n\n")
+
+cat("--- 3 MAD Cutoff ---\n")
+cat("Threshold:", round(cutoff_3mad, 2), "\n")
+cat("Cells removed:", sum(counts > cutoff_3mad), "\n")
+cat("Cells kept:", sum(counts <= cutoff_3mad), "\n\n")
+
+cat("--- 5 MAD Cutoff ---\n")
+cat("Threshold:", round(cutoff_5mad, 2), "\n")
+cat("Cells removed:", sum(counts > cutoff_5mad), "\n")
+cat("Cells kept:", sum(counts <= cutoff_5mad), "\n")
+
+# 3. Visualization (Violin Plot with Cutoff Lines)
+# log scale usually to see the tail better, but linear works for cutoffs
+p <- VlnPlot(seu_h, features = "nCount_RNA", pt.size = 0, group.by = "pool_id") +
+  geom_hline(yintercept = cutoff_3mad, color = "red", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = cutoff_5mad, color = "blue", linetype = "dashed", size = 1) +
+  annotate("text", 
+           x = 5.1,       # Places text just to the right of the last violin
+           y = 100000, 
+           label = paste0("3 MAD: ", round(cutoff_3mad)), 
+           vjust = 1.5,             # Pushes label slightly BELOW the red line
+           hjust = 0,               # Left-aligns text so it starts at the x-coordinate
+           color = "red", 
+           fontface = "bold") +
+  
+  # Label for 5 MAD (Blue) - Placed at the far right
+  annotate("text", 
+           x = 5.1,       # Places text just to the right of the last violin
+           y = 100000, 
+           label = paste0("5 MAD: ", round(cutoff_5mad)), 
+           vjust = -0.5,            # Pushes label slightly ABOVE the blue line
+           hjust = 0,               # Left-aligns text
+           color = "blue", 
+           fontface = "bold") +
+           
+  ggtitle("nCount_RNA Distribution: 3 vs 5 MAD") +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  xlab("Pool number") +
+  ylab("UMI counts")
+
+
+ggsave(
+  filename = file.path(graphs_dir, glue("count_dist_3_vs_5_mad.pdf")),
+  plot = p,
+  width = 8, height = 5, dpi = 300, units = "in")
+```
+
+#### Counts vs feature plot with MAD cut-offs
+
+```{r}
+qc_scatter <- FeatureScatter(seu_h, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "pool_id", shuffle=TRUE) +
+  
+  # Add vertical line for 3 MAD (Red)
+  geom_vline(xintercept = cutoff_3mad, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = cutoff_3mad, y = max(seu_h$nFeature_RNA), label = "3 MAD", 
+           color = "red", angle = 90, vjust = -0.5, hjust = 1, fontface = "bold") +
+
+  # Add vertical line for 5 MAD (Blue)
+  geom_vline(xintercept = cutoff_5mad, color = "blue", linetype = "dashed", size = 1) +
+  annotate("text", x = cutoff_5mad, y = max(seu_h$nFeature_RNA), label = "5 MAD", 
+           color = "blue", angle = 90, vjust = -0.5, hjust = 1, fontface = "bold") +
+  
+  ggtitle("Count vs Feature (with MAD Cutoffs)") + 
+  xlab("Number of counts") +
+  ylab("Number of genes")
+
+print(qc_scatter)
+
+# Save the plot
+ggsave(
+  filename = file.path(graphs_dir, "QC_count_vs_feat_lines.pdf"),
+  plot = qc_scatter,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+```
+
+# Initial subsetting
+
+Filter out low features (\<500), High mitochondrial percent, and MAD5 outliers
+
+```{r}
+ncol(seu_h)
+seu_h_f <- subset(seu_h, subset = nFeature_RNA > 500 & percent.mt < 15 & mad5_outlier != "Outlier")
+ncol(seu_h_f)
+qs_save(seu_h_f, file.path(objects_dir, "seu_h_initial_subset.qs2"))
+```
+
+## Re-reading in to remove clusters - loop. Ignore this on first pass!!!
+
+```{r}
+# seu_h_f <- qs_read(file.path(objects_dir, "seu_h_initial_subset.qs2"))
+# unwanted_cells <- qs_read(file.path(objects_dir, "unwanted_cells_9_6.qs2"))
+# ncol(seu_h_f)
+# seu_h_f <- subset(seu_h_f, subset = percent.mt < 10 & !(colnames(seu_h_f) %in% unwanted_cells))
+# ncol(seu_h_f)
+# 
+# qs_save(seu_h_f, file.path(objects_dir, "seu_h_subset.qs2"))
+# seu_h_f <- qs_read(file.path(objects_dir, "seu_h_subset.qs2"))
+```
+
+## Naive UMAP on all data
+
+Can be used for identifying if strictly need to integrate.
+
+```{r}
+options(future.globals.maxSize = 65 * 1024^3)
+seu_h_f <- SCTransform(seu_h_f, vst.flavor="v2", verbose=FALSE)
+
+seu_h_f <- RunPCA(seu_h_f)
+
+seu_h_f <- RunUMAP(seu_h_f, dims=1:30)
+```
+
+### Plot of unintegrated grouped UMAPs
+
+```{r}
+p <- DimPlot(seu_h_f, 
+        reduction = "umap", 
+        split.by = "pool_id",
+  group.by = "pool_id") +
+  ggtitle("Unintegrated Data: Split by Pool")
+p
+ggsave(file.path(graphs_dir, "QC_umaps_pools_split.pdf"), plot = p, width = 18, height = 6, units = "in")
+```
+
+# 3. Individual batch processing
+
+Before integrating, processed each batch individually to check for quality and assign cell type scores (e.g. Mancuso).
+
+```{r}
+batches <- SplitObject(seu_h_f, split.by = "pool_id")
+
+
+options(future.globals.maxSize= 8912896000000)
+batches <- lapply(batches, SCTransform)
+
+
+
+batches <- lapply(batches, \(o) {
+  set.seed(42)
+  o <- RunPCA(
+    o, 
+    npcs = 30,
+    assay = "SCT",
+    verbose = FALSE
+  )
+  set.seed(42)
+  o <- RunUMAP(
+    o,
+    dims = 1:25,
+    n.neighbors = 30L,
+    n.epochs = 500,
+    min.dist = 0.05
+  )
+  o
+})
+  
+
+invisible(lapply(names(batches), function(nm){
+  p <- DimPlot(batches[[nm]], reduction = "umap", group.by = "orig.ident", shuffle=TRUE) + ggtitle(nm)
+  p2<- FeaturePlot(batches[[nm]], features = c("nCount_RNA", "nFeature_RNA", "percent.mt"), cols = c("#440154", "#FDE725"))
+  p3 <- DimPlot(batches[[nm]], group.by = "scDblFinder.class") +
+  ggtitle(glue("Doublet Locations Batch{nm}"))
+  p4 <- DimPlot(batches[[nm]], reduction = "umap", split.by = "orig.ident", shuffle=TRUE, ncol = 3) + ggtitle(nm)
+  print(p)
+  print(p2)
+  print(p3)
+  print(p4)
+  
+  #create batch subdirectories for each batch 
+  batch_graphs_dir <- file.path(graphs_dir, glue("batch_{nm}"))
+  dir.create(batch_graphs_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  ggsave(
+  filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_umap_samples_overlayed.pdf")),
+  plot = p,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+  ggsave(
+  filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_umap_qc_x3.pdf")),
+  plot = p2,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+  ggsave(
+    filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_doublets_umap.pdf")),
+    plot = p3,
+    width = 7, height = 5, dpi = 300, units = "in"
+  )
+  ggsave(
+  filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_umap_samples_split.pdf")),
+  plot = p4,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+  
+  
+}))
+
+```
+
+### Save initial clustered batches
+
+```{r}
+qs_save(batches, file = file.path(objects_dir, "umap_batches.qs2"))
+```
+
+### Read in initial data if needed
+
+```{r}
+batches <- qs_read(file.path(objects_dir, "umap_batches.qs2"))
+```
+
+## Clustering
+
+```{r}
+res = 0.2
+batches <- lapply(batches, \(o) {
+  set.seed(42)
+  o <- FindNeighbors(o, reduction = "pca", dims = 1:30)
+  set.seed(42)
+  o <- FindClusters(o, resolution = res)
+})
+
+invisible(lapply(names(batches), function(nm){
+  
+  p <- DimPlot(batches[[nm]], reduction = "umap", label = TRUE) + ggtitle(glue("Batch {nm} UMAP {res} resolution"))
+  print(p)
+  
+  batch_graphs_dir <- file.path(graphs_dir, glue("batch_{nm}"))
+  
+  ggsave(
+  filename = file.path(batch_graphs_dir, glue("clusters_batch_{nm}_{res}.pdf")),
+  plot = p,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+}))
+```
+
+#### Optional save for progress
+
+```{r}
+for (i in seq_along(batches)) {
+  qs_save(batches[[i]], file = paste0(objects_dir, "/", "batch", i, "_clustered.qs2"))
+}
+```
+
+#### Read in if needed
+
+```{r}
+files <- list.files(
+  path = objects_dir, 
+  pattern = "batch[0-9]+_clustered.qs2", # Matches your specific naming pattern
+  full.names = TRUE
+)
+batches <- lapply(files, qs_read)
+```
+
+## Initial identification of non-microglial clusters
+
+Using signature txt files supplied by Emma
+
+```{r}
+#emma text files
+sig_dir <- "signatures"  
+
+gs_myeloid <- readLines(file.path(sig_dir, "myeloid.txt"))
+myeloid_seu <- intersect(gs_myeloid, rownames(batches[[1]]))
+myeloid_seu
+
+
+gs_proliferating <- readLines(file.path(sig_dir, "proliferating.txt"))
+prolif_seu <- intersect(gs_proliferating, rownames(batches[[1]]))
+gs_proliferating
+
+gs_macrophage <- readLines(file.path(sig_dir, "macrophage.txt"))
+macrophage_seu <- intersect(gs_macrophage, rownames(batches[[1]]))
+macrophage_seu
+
+gs_dendritic <- readLines(file.path(sig_dir, "dendritic.txt"))
+dendritic_seu <- intersect(gs_dendritic, rownames(batches[[1]]))
+dendritic_seu
+
+
+#mancuso modules
+mancuso <- "/nemo/lab/destrooperb/home/shared/zanettc/Mancuso2024_genesets"  
+
+gs_crm <- readLines(file.path(mancuso, "CRM_geneset.txt"))
+gs_dam <- readLines(file.path(mancuso, "DAM_geneset.txt"))
+gs_hla <- readLines(file.path(mancuso, "HLA_geneset.txt"))
+gs_hm <- readLines(file.path(mancuso, "HM_geneset.txt"))
+gs_irm <- readLines(file.path(mancuso, "IRM_geneset.txt"))
+gs_rm <- readLines(file.path(mancuso, "RM_geneset.txt"))
+gs_tcrm <- readLines(file.path(mancuso, "transCRM_geneset.txt"))
+
+```
+
+### Module scoring
+
+```{r}
+gene_sets <- list(
+  dendritic = dendritic_seu,
+  proliferating = prolif_seu,
+  macrophage = macrophage_seu,
+  myeloid = myeloid_seu,
+  CRM = gs_crm,
+  DAM = gs_dam,
+  HLA = gs_hla,
+  HM = gs_hm,
+  IRM = gs_irm,
+  RM = gs_rm,
+  tCRM = gs_tcrm
+)
+
+# process each batch using an index 'i'
+# seq_along() so 'i' becomes 1, 2, 3... corresponding to the list order
+batches <- lapply(seq_along(batches), function(i) {
+  
+  # Extract the object using the index
+  o <- batches[[i]]
+  
+  # Define a clean name for this batch
+  nm <- as.character(i)
+  
+  message(glue("Processing Batch {nm}..."))
+
+  # Setup Directory
+  batch_graphs_dir <- file.path(graphs_dir, glue("batch_{nm}"))
+  if (!dir.exists(batch_graphs_dir)) dir.create(batch_graphs_dir, recursive = TRUE)
+  
+  # 2. Add Module Scores
+  # AddModuleScore calculates the average expression of the gene set 
+  # subtracted by aggregated expression of control feature sets.
+  o <- AddModuleScore(
+    object = o, 
+    features = gene_sets, 
+    name = names(gene_sets),
+    ctrl = 5,
+    seed = 42
+  )
+  
+  # 3. Factorize Clusters for numerical ordering
+  o$seurat_clusters <- factor(
+    o$seurat_clusters, 
+    levels = sort(as.numeric(unique(as.character(o$seurat_clusters))))
+  )
+  Idents(o) <- "seurat_clusters"
+  
+  # 4. Generate Plots
+  
+  # Plot 1: Cell Types
+  p1 <- VlnPlot(
+    o, 
+    features = c("dendritic1", "proliferating2", "macrophage3", "myeloid4"), 
+    group.by = "seurat_clusters", 
+    pt.size = 0, 
+    ncol = 2
+  ) + ggtitle(glue("Batch {nm}: Cell Types"))
+  
+  # Plot 2: Mancuso Signatures
+  p2 <- VlnPlot(
+    o, 
+    features = c("CRM5", "DAM6", "HLA7", "HM8", "IRM9", "RM10", "tCRM11"), 
+    group.by = "seurat_clusters", 
+    pt.size = 0, 
+    ncol = 4
+  ) + ggtitle(glue("Batch {nm}: Mancuso Scores"))
+  
+  # Plot 3: QC
+  p3 <- VlnPlot(
+    o, 
+    features = c("nFeature_RNA"), 
+    group.by = "seurat_clusters", 
+    pt.size = 0, 
+    ncol = 2
+  ) + ggtitle(glue("Batch {nm}: QC"))
+
+  # 5. Save Plots
+  ggsave(
+    filename = file.path(batch_graphs_dir, glue("batch_{nm}_celltypes.pdf")),
+    plot = p1, width = 7, height = 5, dpi = 300
+  )
+  
+  ggsave(
+    filename = file.path(batch_graphs_dir, glue("batch_{nm}_mancuso.pdf")),
+    plot = p2, width = 10, height = 5, dpi = 300
+  )
+  
+  ggsave(
+    filename = file.path(batch_graphs_dir, glue("batch_{nm}_qc.pdf")),
+    plot = p3, width = 10, height = 5, dpi = 300
+  )
+  
+  # Return the modified object to update the list
+  return(o)
+})
+```
+
+# 4. Normalisation and Integration
+
+Merges batches using reciprocal PCA (RPCA) to align them.
+
+RPCA is relatively gentle, so removes technical batch effects while hopefully preserving biological variance.
+
+```{r}
+#merge list of batches back into one object
+merged_obj <- merge(batches[[1]], y = batches[-1])
+
+Idents(merged_obj) <- "pool_id"
+```
+
+```{r}
+#run SCTransform on merged object 
+options(future.globals.maxSize = 100 * 1024^3)
+merged_obj <- SCTransform(merged_obj, vst.flavor = "v2", verbose = FALSE)
+```
+
+```{r}
+#run PCA on unintegrated object (required for RPCA)
+merged_obj <- RunPCA(merged_obj, verbose = FALSE, assay = "SCT")
+```
+
+```{r}
+set.seed(42)
+options(future.globals.maxSize = 100 * 1024^3)
+#Change this for each diff method
+int_method = "rpca"
+DefaultAssay(merged_obj) <- "SCT"
+merged_obj <- IntegrateLayers(
+  object = merged_obj, 
+  method = RPCAIntegration, #RPCAIntegration, #HarmonyIntegration
+  normalization.method = "SCT", 
+  orig.reduction = "pca", 
+  new.reduction = glue("integrated.{int_method}"),
+  verbose = FALSE
+)
+```
+
+# 5. Clustering and annotation
+
+Using integrated reduction
+
+```{r}
+set.seed(42)
+merged_obj <- FindNeighbors(
+  merged_obj, 
+  reduction = glue("integrated.{int_method}"), 
+  dims = 1:30
+)
+set.seed(42)
+int_method <- "rpca"
+cluster_resolution = 0.15
+
+#find clusters
+merged_obj <- FindClusters(
+  merged_obj, 
+  resolution = cluster_resolution, 
+  cluster.name = glue("{int_method}_clusters"), 
+  graph.name = "SCT_snn"
+)
+```
+
+## Run UMAP on integrated reduction
+
+```{r}
+set.seed(42)
+merged_obj <- RunUMAP(
+  merged_obj, 
+  #reduction = glue("integrated.{int_method}"), 
+  dims = 1:30, 
+  reduction.name = glue("umap.{int_method}")
+)
+
+```
+
+## Save integrated object
+
+```{r}
+qs_save(merged_obj, file= file.path(objects_dir, "prelabelled_integrated_rpca.qs2"))
+```
+
+## Plot diagnostic UMAP graphs
+
+-   Initial clusters
+
+-   Sample distribution
+
+-   Pool distribution
+
+-   QC (Number of genes, UMIs, % MT)
+
+-   Doulbets and outliers
+
+-   Split by condition
+
+```{r}
+
+#PLOT INITIAL CLUSTERS#########################################
+p1 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"), 
+  group.by = glue("{int_method}_clusters"), 
+  label = TRUE
+) + ggtitle(glue("Clusters {cluster_resolution} resolution"))
+
+#CHECK SAMPLE DISTRIBUTION#####################################
+p2 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"),  
+  group.by = "orig.ident", # Or whatever column holds your batch ID
+  shuffle = TRUE,          # Shuffles points so one batch doesn't hide another
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Sample Distribution Overlaid")
+
+
+p2.5 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"),  
+  split.by = "orig.ident", 
+  ncol = 5,
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Sample Distribution Split")
+
+#CHECK POOL DISTRIBUTION#######################################
+p3 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"), 
+  group.by = "pool_id", # Or whatever column holds your batch ID
+  shuffle = TRUE,          # Shuffles points so one batch doesn't hide another
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Pool Distribution")
+
+p3.5 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"), 
+  split.by = "pool_id", # Or whatever column holds your batch ID
+  shuffle = TRUE,          # Shuffles points so one batch doesn't hide another
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Pool Distribution")
+
+#QC OF COUNTS, # GENES, % MT TRANSCRIPTS#######################
+p4 <- FeaturePlot(merged_obj, 
+                  reduction = glue("umap.{int_method}"), 
+                  features = c("nCount_RNA", "nFeature_RNA", "percent.mt"  ), 
+                  cols = c("#440154", "#FDE725"))
+
+#DOUBLET PLOT #################################################
+p5 <- DimPlot(merged_obj,
+              reduction = glue("umap.{int_method}"),
+              group.by = "scDblFinder.class") +
+  ggtitle("Doublet Locations")
+
+p5.5 <- DimPlot(merged_obj,
+              reduction = glue("umap.{int_method}"),
+              group.by = "mad3_outlier") +
+  ggtitle("MAD3 Outlier Locations")
+
+#PLOTS FOR GROUPS #############################################
+p6 <- DimPlot(merged_obj, 
+              reduction = glue("umap.{int_method}"), 
+              group.by = "group_id", shuffle=TRUE) +
+  ggtitle("Condition Locations")
+
+p6.5 <- DimPlot(merged_obj, 
+              reduction = glue("umap.{int_method}"), 
+              split.by = "group_id", ncol=5) +
+  ggtitle("Condition Locations")
+
+print(p1)
+print(p2)
+print(p2.5)
+print(p3)
+print(p4)
+print(p5)
+print(p5.5)
+print(p6)
+print(p6.5)
+print(p3.5)
+
+
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_clusters_{cluster_resolution}.pdf")),
+  plot = p1,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_sample_dist_overlaid.pdf")),
+  plot = p2,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_sample_dist_split.pdf")),
+  plot = p2.5,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_batch_dist.pdf")),
+  plot = p3,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_batch_dist_split.pdf")),
+  plot = p3.5,
+  width = 10, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_qc.pdf")),
+  plot = p4,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_doublet_dist.pdf")),
+  plot = p5,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_outlier_dist.pdf")),
+  plot = p5.5,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_condition_dist_overlaid.pdf")),
+  plot = p6,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_condition_dist_split.pdf")),
+  plot = p6.5,
+  width = 7, height = 5, dpi = 300, units = "in")
+```
+
+## Join layers
+
+JoinLayers is needed to collapse separate batch raw counts into a single counts matrix, so can plot all of them together as one dataset.
+
+For dotplots, standard log-normalisation is easier to interpret. Important as need to correct for sequencing depth.
+
+Scale data is necessary for dotplots and heatmaps - z-scored.
+
+```{r}
+DefaultAssay(merged_obj) <- "RNA"
+merged_obj <- JoinLayers(merged_obj, assay= "RNA")
+
+#SCTransform does this automatically. 
+#Corrects for some cells being sequenced deeper than others
+merged_obj <- NormalizeData(merged_obj)
+#some genes are louder than others - drowns out signal of actual marker genes. Scales so mean expression across all cells is 0. 
+merged_obj <- ScaleData(merged_obj)
+```
+
+## Mancuso sense check
+
+Module scores for Mancuso modules
+
+```{r}
+mancuso <- "/nemo/lab/destrooperb/home/shared/zanettc/Mancuso2024_genesets"  
+
+gs_crm <- readLines(file.path(mancuso, "CRM_geneset.txt"))
+gs_dam <- readLines(file.path(mancuso, "DAM_geneset.txt"))
+gs_hla <- readLines(file.path(mancuso, "HLA_geneset.txt"))
+gs_hm <- readLines(file.path(mancuso, "HM_geneset.txt"))
+gs_irm <- readLines(file.path(mancuso, "IRM_geneset.txt"))
+gs_rm <- readLines(file.path(mancuso, "RM_geneset.txt"))
+gs_tcrm <- readLines(file.path(mancuso, "transCRM_geneset.txt"))
+
+#Load in non-microglia gene sets
+sig_dir <- "signatures"  
+
+gs_myeloid <- readLines(file.path(sig_dir, "myeloid.txt"))
+myeloid_seu <- intersect(gs_myeloid, rownames(merged_obj))
+myeloid_seu
+head(rownames(merged_obj))
+
+gs_proliferating <- readLines(file.path(sig_dir, "proliferating.txt"))
+prolif_seu <- intersect(gs_proliferating, rownames(merged_obj))
+gs_proliferating
+
+gs_macrophage <- readLines(file.path(sig_dir, "macrophage.txt"))
+macrophage_seu <- intersect(gs_macrophage, rownames(merged_obj))
+macrophage_seu
+
+gs_dendritic <- readLines(file.path(sig_dir, "dendritic.txt"))
+dendritic_seu <- intersect(gs_dendritic, rownames(merged_obj))
+dendritic_seu
+
+gene_sets <- list(
+  dendritic = dendritic_seu,
+  proliferating = prolif_seu,
+  macrophage = macrophage_seu,
+  myeloid = myeloid_seu,
+  CRM = gs_crm,
+  DAM = gs_dam,
+  HLA = gs_hla,
+  HM = gs_hm,
+  IRM = gs_irm,
+  RM = gs_rm,
+  tCRM = gs_tcrm
+)
+
+merged_obj <- AddModuleScore(merged_obj, features = gene_sets, name = names(gene_sets))
+View(merged_obj@meta.data)
+
+
+merged_obj$seurat_clusters <- factor(
+  merged_obj$rpca_clusters, 
+  levels = sort(as.numeric(unique(as.character(merged_obj$rpca_clusters))))
+)   
+merged_obj$seurat_clusters <- Idents(merged_obj)
+
+View(merged_obj@meta.data)
+p <- VlnPlot(
+  merged_obj, 
+  features = c("dendritic1", "proliferating2", "macrophage3", "myeloid4"), 
+  group.by = "seurat_clusters", 
+  pt.size = 0, 
+  ncol = 2
+)
+p
+
+View(merged_obj@meta.data)                                   
+p2 <- VlnPlot(
+  merged_obj, 
+  features = c("CRM5", "DAM6", "HLA7", "HM8", "IRM9","RM10", "tCRM11"), 
+  group.by = "seurat_clusters", 
+  pt.size = 0, 
+  ncol = 4
+)
+
+
+p3 <- VlnPlot(
+  merged_obj, 
+  features = c("nFeature_RNA"), 
+  group.by = "seurat_clusters", 
+  pt.size = 0, 
+  ncol = 2
+)
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_nonmicroglia_{cluster_resolution}.pdf")),
+  plot = p,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_mancuso_{cluster_resolution}.pdf")),
+  plot = p2,
+  width = 10, height = 5, dpi = 300, units = "in"
+)
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_features_{cluster_resolution}.pdf")),
+  plot = p3,
+  width = 10, height = 5, dpi = 300, units = "in"
+)
+
+table(merged_obj$seurat_clusters)
+```
+
+# 6. Find cluster markers
+
+Uses Seurat function FindAllMarkers to find the key upregulated genes for each cluster.
+
+```{r}
+DefaultAssay(merged_obj) <- "RNA"
+library(presto)
+Idents(merged_obj) <- glue("{int_method}_clusters")
+markers <- FindAllMarkers(
+  merged_obj,
+  test.use = "wilcox",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+head(markers)
+
+write.csv(markers, file.path(objects_dir, glue("wilcox_markers_{cluster_resolution}.csv")))
+
+#check of top 10 cluster markers for each cluster
+top10_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+print(top10_markers)
+
+#specific cluster interrogation if wanted
+cluster5_markers <- markers %>%
+  filter(cluster == 5) %>%
+  arrange(desc(avg_log2FC))
+
+cluster5_markers
+```
+
+## Mitochondrial % violin plot
+
+```{r}
+p <- VlnPlot(merged_obj, features = "percent.mt", pt.size = 0) + 
+  geom_hline(yintercept = 15, linetype = "dashed", color = "red")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_mt_{cluster_resolution}.pdf")),
+  plot = p,
+  width = 10, height = 5, dpi = 300, units = "in"
+)
+```
+
+## Label integrated object
+
+Labelled according to Mancuso signatures and dotplot genes.
+
+```{r}
+Idents(merged_obj) <- "seurat_clusters"
+
+new_cluster_ids <- c(
+"0" = "HM_1",
+"1" = "tCRM_1",
+"2" = "tCRM_2",
+"3" = "DAM/HLA",
+"4" = "IRM",
+"5" = "HLA/myeloid",
+"6" = "Proliferating",
+"7" = "HM_2", 
+"8" = "CRM"
+)
+
+merged_obj <- RenameIdents(merged_obj, new_cluster_ids)
+
+p <- DimPlot(merged_obj, reduction="umap.rpca", label=TRUE, repel=TRUE)
+print(p)
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("labelled_integrated_{cluster_resolution}.png")),
+  plot = p,
+  device = ragg::agg_png,  # key bit
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+
+```
+
+```{r}
+qs_save(merged_obj, glue("labelled_integrated_{cluster_resolution}.qs2"))
+```
+
+## Refining labelled umap
+
+```{r}
+library(ggplot2)
+library(scales)
+library(glue)
+library(ggrepel) # Required for the white text halo
+
+# 1. Update Labels (with the fix from before) ---------------------------------
+cluster_counts <- table(Idents(merged_obj))
+new_labels <- paste0(names(cluster_counts), "\n n = ", comma(as.numeric(cluster_counts)))
+names(new_labels) <- names(cluster_counts)
+merged_obj_plot <- RenameIdents(merged_obj, new_labels)
+
+# 2. Calculate Centroids for Custom Labeling ----------------------------------
+# We need to calculate where to put the text manually to apply the 'halo' effect
+umap_coords <- data.frame(Embeddings(merged_obj_plot, "umap.rpca"))
+# Add the cluster identity to this dataframe
+umap_coords$cluster <- Idents(merged_obj_plot)
+
+# Calculate the mean X and Y for every cluster
+centroids <- aggregate(cbind(umaprpca_1, umaprpca_2) ~ cluster, data = umap_coords, mean)
+
+# 3. Setup Axis Geometry ------------------------------------------------------
+# (Same logic as before, just ensuring we use the right column names)
+x_range <- range(umap_coords[,1])
+y_range <- range(umap_coords[,2])
+
+axis_origin_x <- x_range[1] - (diff(x_range) * 0.1)
+axis_origin_y <- y_range[1] - (diff(y_range) * 0.1)
+axis_length   <- (diff(x_range) * 0.2)
+
+# 4. Generate the Polished Plot -----------------------------------------------
+p <- DimPlot(merged_obj_plot, 
+             reduction = "umap.rpca", 
+             label = FALSE,      # Turn OFF default labels
+             pt.size = 0.1) +    
+  NoLegend() + 
+  NoAxes() + 
+  theme(plot.title = element_blank()) +
+  
+  # --- The "Nicer" Text Layer (White Halo + Bold) ---
+  geom_text_repel(data = centroids,
+                  aes(x = umaprpca_1, y = umaprpca_2, label = cluster),
+                  fontface = "bold",      # Bold text
+                  size = 4.5,             # Slightly larger
+                  color = "black",        # Text color
+                  bg.color = "white",     # THE HALO: White outline
+                  bg.r = 0.15,            # Radius of the halo
+                  force = 5,              # Repel force (adjust if labels scatter too much)
+                  min.segment.length = 0) + # Draw lines if labels are far away
+
+  # --- L-Shaped Axes (Thicker for better look) ---
+  annotate("segment", x = axis_origin_x, xend = axis_origin_x + axis_length, 
+           y = axis_origin_y, yend = axis_origin_y, 
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"), 
+           size = 1.2, lineend = "round") + # Thicker size (1.2)
+  
+  annotate("segment", x = axis_origin_x, xend = axis_origin_x, 
+           y = axis_origin_y, yend = axis_origin_y + axis_length, 
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"), 
+           size = 1.2, lineend = "round") +
+
+  # --- Axis Labels (Bold) ---
+  annotate("text", x = axis_origin_x + (axis_length/2), y = axis_origin_y - 1, 
+           label = "UMAP 1", hjust = 0.5, vjust = 1, fontface = "bold") +
+  annotate("text", x = axis_origin_x - 1, y = axis_origin_y + (axis_length/2), 
+           label = "UMAP 2", angle = 90, hjust = 1, vjust = 0.5, fontface = "bold") +
+
+  # --- Total Count (Bold) ---
+  annotate("text", x = mean(x_range), y = axis_origin_y - 2.5, 
+           label = paste0("Total cells = ", comma(length(Cells(merged_obj)))), 
+           size = 5, fontface = "bold")
+
+print(p)
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("labelled_polished_{cluster_resolution}.pdf")),
+  plot = p,
+  device = cairo_pdf,
+  width = 8, height = 6, dpi = 300, units = "in"
+)
+```
+
+# 7. Removing unwanted clusters
+
+```{r}
+merged_obj <- qs_read("~/home/shared/zanettc/emily_transcriptomics/output/jan_data/run4/objects/prelabelled_integrated_rpca.qs2")
+unwanted_cells <- WhichCells(merged_obj, idents=c("9", "6"))
+length(unwanted_cells)
+
+qs_save(unwanted_cells, file.path(objects_dir, "unwanted_cells_9_6.qs2"))
+```
+
+## Contrasting BDAE150.1e vs other mice
+
+```{r}
+merged_obj <- qs_read(file.path(objects_dir, "prelabelled_integrated_rpca.qs2"))
+```
+
+```{r}
+Idents(merged_obj) <- "orig.ident"
+unique(merged_obj@meta.data$orig.ident)
+markers <- FindMarkers(
+  merged_obj,
+  ident.1 = "BDAE50.1A",
+  ident.2 = c("BDAE50.1C", "BDAE50.1E"),
+  test.use = "wilcox",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+markers %>% arrange(desc(avg_log2FC))
+table(Idents(merged_obj))
+```
+
+# 8. Switching metadata
+
+These mice were mislabelled in the metadata - corrected here.
+
+```{r}
+merged_obj <- qs_read(file.path(objects_dir, "prelabelled_integrated_rpca.qs2"))
+
+mouse_1_id <- "BDAG185.1B"
+
+mouse_2_id <- "BDAG185.1D"
+
+merged_obj@meta.data <- merged_obj@meta.data %>%
+  mutate(microglia = case_when(
+    orig.ident == mouse_1_id ~ "A",
+    orig.ident == mouse_2_id ~ "B",
+    TRUE ~ microglia # Keeps all other mice exactly as they were
+  ))
+
+merged_obj@meta.data$group_id <- paste(merged_obj@meta.data$app_genotype, merged_obj@meta.data$microglia, sep = "_")
+
+table(merged_obj$orig.ident, merged_obj$microglia)
+
+
+#BDAG56.1F was wrongly input into the metadata - should be BDAE56.1F - hu/hu not NLGF
+#update name, group_id, app_genotype
+
+table(merged_obj@meta.data$orig.ident, merged_obj@meta.data$group_id)
+
+merged_obj@meta.data <- merged_obj@meta.data %>%
+  mutate(
+    app_genotype = case_when(orig.ident == "BDAG56.1F" ~ "hAPP",
+                             TRUE ~ app_genotype),
+    orig.ident = case_when(orig.ident == "BDAG56.1F" ~ "BDAE56.1F",
+                           TRUE ~ orig.ident)
+  )
+merged_obj@meta.data$group_id <- paste(merged_obj@meta.data$app_genotype, merged_obj@meta.data$microglia, sep = "_")
+
+
+table(merged_obj@meta.data$orig.ident, merged_obj@meta.data$group_id)
+
+
+
+qs_save(merged_obj, file= file.path(objects_dir, "prelabelled_integrated_rpca.qs2"))
+```
