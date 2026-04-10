@@ -1,0 +1,27 @@
+project:
+  type: website
+  output-dir: docs
+  render:
+    - "**/*.qmd"  # The double asterisk tells it to check subfolders
+    
+
+execute:
+  freeze: auto
+  
+website:
+  title: "Trisomy scRNA-seq"
+  sidebar:
+    style: "docked"
+    contents:
+      - text: "Seurat_v1"
+        file: notebooks/seurat_trisomy_v1.qmd
+      - text: "Seurat_v2"
+        file: notebooks/seurat_trisomy_v2.qmd
+      
+format:
+  html:
+    theme: cosmo
+    df-print: paged
+    toc: true
+    code-fold: show
+    code-copy: true

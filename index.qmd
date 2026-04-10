@@ -1,0 +1,9 @@
+---
+title: "Trisomy scRNA-seq analysis"
+format: html
+---
+
+### Pipeline Stages
+
+1. [Seurat v1](notebooks/seurat_trisomy_v1.qmd)
+2. [Seurat v2](notebooks/seurat_trisomy_v2.qmd)

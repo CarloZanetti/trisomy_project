@@ -1,0 +1,887 @@
+---
+title: "Seurat pipeline for Trisomy data git"
+format: html
+---
+
+```{r}
+rm(list = ls())
+```
+
+==================================================================================================
+
+# Seurat analysis pipeline for trisomy dataset
+
+
+====================================================================================================
+
+## Load libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(Matrix)
+library(Seurat)
+library(SeuratObject)
+library(tidyverse)
+library(glue)
+library(readxl)
+library(future)
+library(gridExtra)
+library(SoupX)
+library(scDblFinder)
+library(SingleCellExperiment)
+library(qs2)
+library(presto)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+```
+
+# 1. Data ingestion
+
+## Load directories - edit for each run
+
+```{r}
+base_dir <- "/nemo/homefs/home/zanettc/home/shared/zanettc/emily_transcriptomics"
+
+#setup output structure
+#change this run number as needed
+run_num <- "run1"
+
+out_dir <- file.path(base_dir, "git_rendered", "output", run_num)
+graphs_dir <- file.path(out_dir, "graphs")
+objects_dir <- file.path(out_dir, "objects")
+
+dir.create(graphs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Re-reading in to remove clusters - loop. Ignore this on first pass!!!
+
+```{r}
+seu_h_f <- qs_read(file.path(objects_dir, "seu_h_initial_subset.qs2"))
+
+unwanted_cells <- qs_read(file.path(objects_dir, "unwanted_cells_9_6.qs2"))
+seu_h_f <- subset(seu_h_f, subset = percent.mt < 10 & scDblFinder.class == 'singlet' & !(colnames(seu_h_f) %in% unwanted_cells))
+ncol(seu_h_f)
+
+qs_save(seu_h_f, file.path(objects_dir, "seu_h_subset.qs2"))
+seu_h_f <- qs_read(file.path(objects_dir, "seu_h_subset.qs2"))
+```
+
+## Naive UMAP on all data
+
+Can be used for identifying if strictly need to integrate.
+
+```{r}
+options(future.globals.maxSize = 65 * 1024^3)
+seu_h_f <- SCTransform(seu_h_f, vst.flavor="v2", verbose=FALSE)
+
+seu_h_f <- RunPCA(seu_h_f)
+
+seu_h_f <- RunUMAP(seu_h_f, dims=1:30)
+```
+
+### Plot of unintegrated grouped UMAPs
+
+```{r}
+p <- DimPlot(seu_h_f, 
+        reduction = "umap", 
+        split.by = "pool_id",
+  group.by = "pool_id") +
+  ggtitle("Unintegrated Data: Split by Pool")
+p
+ggsave(file.path(graphs_dir, "QC_umaps_pools_split.pdf"), plot = p, width = 18, height = 6, units = "in")
+```
+
+# 3. Individual batch processing
+
+Before integrating, processed each batch individually to check for quality and assign cell type scores (e.g. Mancuso).
+
+```{r}
+batches <- SplitObject(seu_h_f, split.by = "pool_id")
+
+
+options(future.globals.maxSize= 8912896000000)
+batches <- lapply(batches, SCTransform)
+
+
+
+batches <- lapply(batches, \(o) {
+  set.seed(42)
+  o <- RunPCA(
+    o, 
+    npcs = 30,
+    assay = "SCT",
+    verbose = FALSE
+  )
+  set.seed(42)
+  o <- RunUMAP(
+    o,
+    dims = 1:25,
+    n.neighbors = 30L,
+    n.epochs = 500,
+    min.dist = 0.05
+  )
+  o
+})
+  
+
+invisible(lapply(names(batches), function(nm){
+  p <- DimPlot(batches[[nm]], reduction = "umap", group.by = "orig.ident", shuffle=TRUE) + ggtitle(nm)
+  p2<- FeaturePlot(batches[[nm]], features = c("nCount_RNA", "nFeature_RNA", "percent.mt"), cols = c("#440154", "#FDE725"))
+  p3 <- DimPlot(batches[[nm]], group.by = "scDblFinder.class") +
+  ggtitle(glue("Doublet Locations Batch{nm}"))
+  p4 <- DimPlot(batches[[nm]], reduction = "umap", split.by = "orig.ident", shuffle=TRUE, ncol = 3) + ggtitle(nm)
+  print(p)
+  print(p2)
+  print(p3)
+  print(p4)
+  
+  #create batch subdirectories for each batch 
+  batch_graphs_dir <- file.path(graphs_dir, glue("batch_{nm}"))
+  dir.create(batch_graphs_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  ggsave(
+  filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_umap_samples_overlayed.pdf")),
+  plot = p,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+  ggsave(
+  filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_umap_qc_x3.pdf")),
+  plot = p2,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+  ggsave(
+    filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_doublets_umap.pdf")),
+    plot = p3,
+    width = 7, height = 5, dpi = 300, units = "in"
+  )
+  ggsave(
+  filename = file.path(batch_graphs_dir,glue("QC_batch{nm}_umap_samples_split.pdf")),
+  plot = p4,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+  
+  
+}))
+
+```
+
+### Save initial clustered batches
+
+```{r}
+qs_save(batches, file = file.path(objects_dir, "umap_batches.qs2"))
+```
+
+### Read in initial data if needed
+
+```{r}
+batches <- qs_read(file.path(objects_dir, "umap_batches.qs2"))
+```
+
+## Clustering
+
+```{r}
+res = 0.2
+batches <- lapply(batches, \(o) {
+  set.seed(42)
+  o <- FindNeighbors(o, reduction = "pca", dims = 1:30)
+  set.seed(42)
+  o <- FindClusters(o, resolution = res)
+})
+
+invisible(lapply(names(batches), function(nm){
+  
+  p <- DimPlot(batches[[nm]], reduction = "umap", label = TRUE) + ggtitle(glue("Batch {nm} UMAP {res} resolution"))
+  print(p)
+  
+  batch_graphs_dir <- file.path(graphs_dir, glue("batch_{nm}"))
+  
+  ggsave(
+  filename = file.path(batch_graphs_dir, glue("clusters_batch_{nm}_{res}.pdf")),
+  plot = p,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+}))
+```
+
+#### Optional save for progress
+
+```{r}
+for (i in seq_along(batches)) {
+  qs_save(batches[[i]], file = paste0(objects_dir, "/", "batch", i, "_clustered.qs2"))
+}
+```
+
+#### Read in if needed
+
+```{r}
+files <- list.files(
+  path = objects_dir, 
+  pattern = "batch[0-9]+_clustered.qs2", # Matches your specific naming pattern
+  full.names = TRUE
+)
+batches <- lapply(files, qs_read)
+```
+
+## Initial identification of non-microglial clusters
+
+Using signature txt files supplied by Emma
+
+```{r}
+#emma text files
+sig_dir <- file.path(base_dir,"signatures")
+
+gs_myeloid <- readLines(file.path(sig_dir, "myeloid.txt"))
+myeloid_seu <- intersect(gs_myeloid, rownames(batches[[1]]))
+myeloid_seu
+
+
+gs_proliferating <- readLines(file.path(sig_dir, "proliferating.txt"))
+prolif_seu <- intersect(gs_proliferating, rownames(batches[[1]]))
+gs_proliferating
+
+gs_macrophage <- readLines(file.path(sig_dir, "macrophage.txt"))
+macrophage_seu <- intersect(gs_macrophage, rownames(batches[[1]]))
+macrophage_seu
+
+gs_dendritic <- readLines(file.path(sig_dir, "dendritic.txt"))
+dendritic_seu <- intersect(gs_dendritic, rownames(batches[[1]]))
+dendritic_seu
+
+
+#mancuso modules
+mancuso <- "/nemo/lab/destrooperb/home/shared/zanettc/Mancuso2024_genesets"  
+
+gs_crm <- readLines(file.path(mancuso, "CRM_geneset.txt"))
+gs_dam <- readLines(file.path(mancuso, "DAM_geneset.txt"))
+gs_hla <- readLines(file.path(mancuso, "HLA_geneset.txt"))
+gs_hm <- readLines(file.path(mancuso, "HM_geneset.txt"))
+gs_irm <- readLines(file.path(mancuso, "IRM_geneset.txt"))
+gs_rm <- readLines(file.path(mancuso, "RM_geneset.txt"))
+gs_tcrm <- readLines(file.path(mancuso, "transCRM_geneset.txt"))
+
+```
+
+### Module scoring
+
+```{r}
+gene_sets <- list(
+  dendritic = dendritic_seu,
+  proliferating = prolif_seu,
+  macrophage = macrophage_seu,
+  myeloid = myeloid_seu,
+  CRM = gs_crm,
+  DAM = gs_dam,
+  HLA = gs_hla,
+  HM = gs_hm,
+  IRM = gs_irm,
+  RM = gs_rm,
+  tCRM = gs_tcrm
+)
+
+# process each batch using an index 'i'
+# seq_along() so 'i' becomes 1, 2, 3... corresponding to the list order
+batches <- lapply(seq_along(batches), function(i) {
+  
+  # Extract the object using the index
+  o <- batches[[i]]
+  
+  # Define a clean name for this batch
+  nm <- as.character(i)
+  
+  message(glue("Processing Batch {nm}..."))
+
+  # Setup Directory
+  batch_graphs_dir <- file.path(graphs_dir, glue("batch_{nm}"))
+  if (!dir.exists(batch_graphs_dir)) dir.create(batch_graphs_dir, recursive = TRUE)
+  
+  # 2. Add Module Scores
+  # AddModuleScore calculates the average expression of the gene set 
+  # subtracted by aggregated expression of control feature sets.
+  o <- AddModuleScore(
+    object = o, 
+    features = gene_sets, 
+    name = names(gene_sets),
+    ctrl = 5,
+    seed = 42
+  )
+  
+  # 3. Factorize Clusters for numerical ordering
+  o$seurat_clusters <- factor(
+    o$seurat_clusters, 
+    levels = sort(as.numeric(unique(as.character(o$seurat_clusters))))
+  )
+  Idents(o) <- "seurat_clusters"
+  
+  # 4. Generate Plots
+  
+  # Plot 1: Cell Types
+  p1 <- VlnPlot(
+    o, 
+    features = c("dendritic1", "proliferating2", "macrophage3", "myeloid4"), 
+    group.by = "seurat_clusters", 
+    pt.size = 0, 
+    ncol = 2
+  ) + ggtitle(glue("Batch {nm}: Cell Types"))
+  
+  # Plot 2: Mancuso Signatures
+  p2 <- VlnPlot(
+    o, 
+    features = c("CRM5", "DAM6", "HLA7", "HM8", "IRM9", "RM10", "tCRM11"), 
+    group.by = "seurat_clusters", 
+    pt.size = 0, 
+    ncol = 4
+  ) + ggtitle(glue("Batch {nm}: Mancuso Scores"))
+  
+  # Plot 3: QC
+  p3 <- VlnPlot(
+    o, 
+    features = c("nFeature_RNA"), 
+    group.by = "seurat_clusters", 
+    pt.size = 0, 
+    ncol = 2
+  ) + ggtitle(glue("Batch {nm}: QC"))
+
+  # 5. Save Plots
+  ggsave(
+    filename = file.path(batch_graphs_dir, glue("batch_{nm}_celltypes.pdf")),
+    plot = p1, width = 7, height = 5, dpi = 300
+  )
+  
+  ggsave(
+    filename = file.path(batch_graphs_dir, glue("batch_{nm}_mancuso.pdf")),
+    plot = p2, width = 10, height = 5, dpi = 300
+  )
+  
+  ggsave(
+    filename = file.path(batch_graphs_dir, glue("batch_{nm}_qc.pdf")),
+    plot = p3, width = 10, height = 5, dpi = 300
+  )
+  
+  # Return the modified object to update the list
+  return(o)
+})
+```
+
+# 4. Normalisation and Integration
+
+Merges batches using reciprocal PCA (RPCA) to align them.
+
+RPCA is relatively gentle, so removes technical batch effects while hopefully preserving biological variance.
+
+```{r}
+#merge list of batches back into one object
+merged_obj <- merge(batches[[1]], y = batches[-1])
+
+Idents(merged_obj) <- "pool_id"
+```
+
+```{r}
+#run SCTransform on merged object 
+options(future.globals.maxSize = 100 * 1024^3)
+merged_obj <- SCTransform(merged_obj, vst.flavor = "v2", verbose = FALSE)
+```
+
+```{r}
+#run PCA on unintegrated object (required for RPCA)
+merged_obj <- RunPCA(merged_obj, verbose = FALSE, assay = "SCT")
+```
+
+```{r}
+set.seed(42)
+options(future.globals.maxSize = 100 * 1024^3)
+#Change this for each diff method
+int_method = "rpca"
+DefaultAssay(merged_obj) <- "SCT"
+merged_obj <- IntegrateLayers(
+  object = merged_obj, 
+  method = RPCAIntegration, #RPCAIntegration, #HarmonyIntegration
+  normalization.method = "SCT", 
+  orig.reduction = "pca", 
+  new.reduction = glue("integrated.{int_method}"),
+  verbose = FALSE
+)
+```
+
+# 5. Clustering and annotation
+
+Using integrated reduction
+
+```{r}
+set.seed(42)
+merged_obj <- FindNeighbors(
+  merged_obj, 
+  reduction = glue("integrated.{int_method}"), 
+  dims = 1:30
+)
+set.seed(42)
+int_method <- "rpca"
+cluster_resolution = 0.15
+
+#find clusters
+merged_obj <- FindClusters(
+  merged_obj, 
+  resolution = cluster_resolution, 
+  cluster.name = glue("{int_method}_clusters"), 
+  graph.name = "SCT_snn"
+)
+```
+
+## Run UMAP on integrated reduction
+
+```{r}
+set.seed(42)
+merged_obj <- RunUMAP(
+  merged_obj, 
+  #reduction = glue("integrated.{int_method}"), 
+  dims = 1:30, 
+  reduction.name = glue("umap.{int_method}")
+)
+
+```
+
+## Save integrated object
+
+```{r}
+qs_save(merged_obj, file= file.path(objects_dir, "prelabelled_integrated_rpca.qs2"))
+
+merged_obj <- qs_read(file.path(objects_dir, "prelabelled_integrated_rpca.qs2"))
+```
+
+## Plot diagnostic UMAP graphs
+
+-   Initial clusters
+
+-   Sample distribution
+
+-   Pool distribution
+
+-   QC (Number of genes, UMIs, % MT)
+
+-   Doulbets and outliers
+
+-   Split by condition
+
+```{r}
+
+#PLOT INITIAL CLUSTERS#########################################
+p1 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"), 
+  group.by = glue("{int_method}_clusters"), 
+  label = TRUE
+) + ggtitle(glue("Clusters {cluster_resolution} resolution"))
+
+#CHECK SAMPLE DISTRIBUTION#####################################
+p2 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"),  
+  group.by = "orig.ident", # Or whatever column holds your batch ID
+  shuffle = TRUE,          # Shuffles points so one batch doesn't hide another
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Sample Distribution Overlaid")
+
+
+p2.5 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"),  
+  split.by = "orig.ident", 
+  ncol = 5,
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Sample Distribution Split")
+
+#CHECK POOL DISTRIBUTION#######################################
+p3 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"), 
+  group.by = "pool_id", # Or whatever column holds your batch ID
+  shuffle = TRUE,          # Shuffles points so one batch doesn't hide another
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Pool Distribution")
+
+p3.5 <- DimPlot(
+  merged_obj, 
+  reduction = glue("umap.{int_method}"), 
+  split.by = "pool_id", # Or whatever column holds your batch ID
+  shuffle = TRUE,          # Shuffles points so one batch doesn't hide another
+  alpha = 0.5              # Transparency helps see overlap
+) + ggtitle("Pool Distribution")
+
+#QC OF COUNTS, # GENES, % MT TRANSCRIPTS#######################
+p4 <- FeaturePlot(merged_obj, 
+                  reduction = glue("umap.{int_method}"), 
+                  features = c("nCount_RNA", "nFeature_RNA", "percent.mt"  ), 
+                  cols = c("#440154", "#FDE725"))
+
+#DOUBLET PLOT #################################################
+p5 <- DimPlot(merged_obj,
+              reduction = glue("umap.{int_method}"),
+              group.by = "scDblFinder.class") +
+  ggtitle("Doublet Locations")
+
+p5.5 <- DimPlot(merged_obj,
+              reduction = glue("umap.{int_method}"),
+              group.by = "mad3_outlier") +
+  ggtitle("MAD3 Outlier Locations")
+
+#PLOTS FOR GROUPS #############################################
+p6 <- DimPlot(merged_obj, 
+              reduction = glue("umap.{int_method}"), 
+              group.by = "group_id", shuffle=TRUE) +
+  ggtitle("Condition Locations")
+
+p6.5 <- DimPlot(merged_obj, 
+              reduction = glue("umap.{int_method}"), 
+              split.by = "group_id", ncol=5) +
+  ggtitle("Condition Locations")
+
+print(p1)
+print(p2)
+print(p2.5)
+print(p3)
+print(p4)
+print(p5)
+print(p5.5)
+print(p6)
+print(p6.5)
+print(p3.5)
+
+
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_clusters_{cluster_resolution}.pdf")),
+  plot = p1,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_sample_dist_overlaid.pdf")),
+  plot = p2,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_sample_dist_split.pdf")),
+  plot = p2.5,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_batch_dist.pdf")),
+  plot = p3,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_batch_dist_split.pdf")),
+  plot = p3.5,
+  width = 10, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_qc.pdf")),
+  plot = p4,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_doublet_dist.pdf")),
+  plot = p5,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_outlier_dist.pdf")),
+  plot = p5.5,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_condition_dist_overlaid.pdf")),
+  plot = p6,
+  width = 7, height = 5, dpi = 300, units = "in")
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("integrated_{int_method}_condition_dist_split.pdf")),
+  plot = p6.5,
+  width = 7, height = 5, dpi = 300, units = "in")
+```
+
+## Join layers
+
+JoinLayers is needed to collapse separate batch raw counts into a single counts matrix, so can plot all of them together as one dataset.
+
+For dotplots, standard log-normalisation is easier to interpret. Important as need to correct for sequencing depth.
+
+Scale data is necessary for dotplots and heatmaps - z-scored.
+
+```{r}
+DefaultAssay(merged_obj) <- "RNA"
+merged_obj <- JoinLayers(merged_obj, assay= "RNA")
+
+#SCTransform does this automatically. 
+#Corrects for some cells being sequenced deeper than others
+merged_obj <- NormalizeData(merged_obj)
+#some genes are louder than others - drowns out signal of actual marker genes. Scales so mean expression across all cells is 0. 
+merged_obj <- ScaleData(merged_obj)
+```
+
+## Mancuso sense check
+
+Module scores for Mancuso modules
+
+```{r}
+mancuso <- "/nemo/lab/destrooperb/home/shared/zanettc/Mancuso2024_genesets"  
+
+gs_crm <- readLines(file.path(mancuso, "CRM_geneset.txt"))
+gs_dam <- readLines(file.path(mancuso, "DAM_geneset.txt"))
+gs_hla <- readLines(file.path(mancuso, "HLA_geneset.txt"))
+gs_hm <- readLines(file.path(mancuso, "HM_geneset.txt"))
+gs_irm <- readLines(file.path(mancuso, "IRM_geneset.txt"))
+gs_rm <- readLines(file.path(mancuso, "RM_geneset.txt"))
+gs_tcrm <- readLines(file.path(mancuso, "transCRM_geneset.txt"))
+
+#Load in non-microglia gene sets
+sig_dir <- "signatures"  
+
+gs_myeloid <- readLines(file.path(base_dir, sig_dir, "myeloid.txt"))
+myeloid_seu <- intersect(gs_myeloid, rownames(merged_obj))
+myeloid_seu
+head(rownames(merged_obj))
+
+gs_proliferating <- readLines(file.path(base_dir,sig_dir, "proliferating.txt"))
+prolif_seu <- intersect(gs_proliferating, rownames(merged_obj))
+gs_proliferating
+
+gs_macrophage <- readLines(file.path(base_dir,sig_dir, "macrophage.txt"))
+macrophage_seu <- intersect(gs_macrophage, rownames(merged_obj))
+macrophage_seu
+
+gs_dendritic <- readLines(file.path(base_dir,sig_dir, "dendritic.txt"))
+dendritic_seu <- intersect(gs_dendritic, rownames(merged_obj))
+dendritic_seu
+
+gene_sets <- list(
+  dendritic = dendritic_seu,
+  proliferating = prolif_seu,
+  macrophage = macrophage_seu,
+  myeloid = myeloid_seu,
+  CRM = gs_crm,
+  DAM = gs_dam,
+  HLA = gs_hla,
+  HM = gs_hm,
+  IRM = gs_irm,
+  RM = gs_rm,
+  tCRM = gs_tcrm
+)
+
+merged_obj <- AddModuleScore(merged_obj, features = gene_sets, name = names(gene_sets))
+
+
+merged_obj$seurat_clusters <- factor(
+  merged_obj$rpca_clusters, 
+  levels = sort(as.numeric(unique(as.character(merged_obj$rpca_clusters))))
+)   
+merged_obj$seurat_clusters <- Idents(merged_obj)
+
+p <- VlnPlot(
+  merged_obj, 
+  features = c("dendritic1", "proliferating2", "macrophage3", "myeloid4"), 
+  group.by = "seurat_clusters", 
+  pt.size = 0, 
+  ncol = 2
+)
+p
+
+p2 <- VlnPlot(
+  merged_obj, 
+  features = c("CRM5", "DAM6", "HLA7", "HM8", "IRM9","RM10", "tCRM11"), 
+  group.by = "seurat_clusters", 
+  pt.size = 0, 
+  ncol = 4
+)
+
+
+p3 <- VlnPlot(
+  merged_obj, 
+  features = c("nFeature_RNA"), 
+  group.by = "seurat_clusters", 
+  pt.size = 0, 
+  ncol = 2
+)
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_nonmicroglia_{cluster_resolution}.pdf")),
+  plot = p,
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_mancuso_{cluster_resolution}.pdf")),
+  plot = p2,
+  width = 10, height = 5, dpi = 300, units = "in"
+)
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_features_{cluster_resolution}.pdf")),
+  plot = p3,
+  width = 10, height = 5, dpi = 300, units = "in"
+)
+
+table(merged_obj$seurat_clusters)
+```
+
+# 6. Find cluster markers
+
+Uses Seurat function FindAllMarkers to find the key upregulated genes for each cluster.
+
+```{r}
+DefaultAssay(merged_obj) <- "RNA"
+library(presto)
+Idents(merged_obj) <- glue("{int_method}_clusters")
+markers <- FindAllMarkers(
+  merged_obj,
+  test.use = "wilcox",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+head(markers)
+
+write.csv(markers, file.path(objects_dir, glue("wilcox_markers_{cluster_resolution}.csv")))
+
+#check of top 10 cluster markers for each cluster
+top10_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+print(top10_markers)
+```
+
+## Mitochondrial % violin plot
+
+```{r}
+p <- VlnPlot(merged_obj, features = "percent.mt", pt.size = 0) + 
+  geom_hline(yintercept = 15, linetype = "dashed", color = "red")
+
+ggsave(
+  filename = file.path(graphs_dir,int_method, cluster_resolution, glue("integrated_{int_method}_clusters_vs_mt_{cluster_resolution}.pdf")),
+  plot = p,
+  width = 10, height = 5, dpi = 300, units = "in"
+)
+```
+
+## Label integrated object
+
+Labelled according to Mancuso signatures and dotplot genes.
+
+```{r}
+Idents(merged_obj)
+new_cluster_ids <- c(
+"0" = "HM_1",
+"1" = "tCRM_1",
+"2" = "tCRM_2",
+"3" = "DAM/HLA",
+"4" = "IRM",
+"5" = "HLA/myeloid",
+"6" = "Proliferating",
+"7" = "HM_2", 
+"8" = "CRM"
+)
+
+merged_obj <- RenameIdents(merged_obj, new_cluster_ids)
+
+p <- DimPlot(merged_obj, reduction="umap.rpca", label=TRUE, repel=TRUE)
+print(p)
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("labelled_integrated_{cluster_resolution}.png")),
+  plot = p,
+  device = ragg::agg_png,  # key bit
+  width = 7, height = 5, dpi = 300, units = "in"
+)
+
+```
+
+```{r}
+qs_save(merged_obj, file.path(objects_dir, glue("labelled_integrated_{cluster_resolution}.qs2")))
+```
+
+## Refining labelled umap
+
+```{r}
+library(scales)
+library(ggrepel) # Required for the white text halo
+
+# 1. Update Labels (with the fix from before) ---------------------------------
+cluster_counts <- table(Idents(merged_obj))
+new_labels <- paste0(names(cluster_counts), "\n n = ", comma(as.numeric(cluster_counts)))
+names(new_labels) <- names(cluster_counts)
+merged_obj_plot <- RenameIdents(merged_obj, new_labels)
+
+# 2. Calculate Centroids for Custom Labeling ----------------------------------
+# We need to calculate where to put the text manually to apply the 'halo' effect
+umap_coords <- data.frame(Embeddings(merged_obj_plot, "umap.rpca"))
+# Add the cluster identity to this dataframe
+umap_coords$cluster <- Idents(merged_obj_plot)
+
+# Calculate the mean X and Y for every cluster
+centroids <- aggregate(cbind(umaprpca_1, umaprpca_2) ~ cluster, data = umap_coords, mean)
+
+# 3. Setup Axis Geometry ------------------------------------------------------
+# (Same logic as before, just ensuring we use the right column names)
+x_range <- range(umap_coords[,1])
+y_range <- range(umap_coords[,2])
+
+axis_origin_x <- x_range[1] - (diff(x_range) * 0.1)
+axis_origin_y <- y_range[1] - (diff(y_range) * 0.1)
+axis_length   <- (diff(x_range) * 0.2)
+
+# 4. Generate the Polished Plot -----------------------------------------------
+p <- DimPlot(merged_obj_plot, 
+             reduction = "umap.rpca", 
+             label = FALSE,      # Turn OFF default labels
+             pt.size = 0.1) +    
+  NoLegend() + 
+  NoAxes() + 
+  theme(plot.title = element_blank()) +
+  
+  # --- The "Nicer" Text Layer (White Halo + Bold) ---
+  geom_text_repel(data = centroids,
+                  aes(x = umaprpca_1, y = umaprpca_2, label = cluster),
+                  fontface = "bold",      # Bold text
+                  size = 4.5,             # Slightly larger
+                  color = "black",        # Text color
+                  bg.color = "white",     # THE HALO: White outline
+                  bg.r = 0.15,            # Radius of the halo
+                  force = 5,              # Repel force (adjust if labels scatter too much)
+                  min.segment.length = 0) + # Draw lines if labels are far away
+
+  # --- L-Shaped Axes (Thicker for better look) ---
+  annotate("segment", x = axis_origin_x, xend = axis_origin_x + axis_length, 
+           y = axis_origin_y, yend = axis_origin_y, 
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"), 
+           size = 1.2, lineend = "round") + # Thicker size (1.2)
+  
+  annotate("segment", x = axis_origin_x, xend = axis_origin_x, 
+           y = axis_origin_y, yend = axis_origin_y + axis_length, 
+           arrow = arrow(length = unit(0.2, "cm"), type = "closed"), 
+           size = 1.2, lineend = "round") +
+
+  # --- Axis Labels (Bold) ---
+  annotate("text", x = axis_origin_x + (axis_length/2), y = axis_origin_y - 1, 
+           label = "UMAP 1", hjust = 0.5, vjust = 1, fontface = "bold") +
+  annotate("text", x = axis_origin_x - 1, y = axis_origin_y + (axis_length/2), 
+           label = "UMAP 2", angle = 90, hjust = 1, vjust = 0.5, fontface = "bold") +
+
+  # --- Total Count (Bold) ---
+  annotate("text", x = mean(x_range), y = axis_origin_y - 2.5, 
+           label = paste0("Total cells = ", comma(length(Cells(merged_obj)))), 
+           size = 5, fontface = "bold")
+
+print(p)
+
+ggsave(
+  filename = file.path(graphs_dir, int_method, cluster_resolution, glue("labelled_polished_{cluster_resolution}.pdf")),
+  plot = p,
+  device = cairo_pdf,
+  width = 8, height = 6, dpi = 300, units = "in"
+)
+```
+
+```{r}
+sessionInfo()
+```
+
+

@@ -1,0 +1,21 @@
+# 1. Bioinformatics Data & Objects (NEVER upload these to GitHub)
+*.rds
+*.RData
+*.h5ad
+*.loom
+*.bam
+*.fastq.gz
+*.csv
+*.tsv
+data/
+output/
+*.rmd
+*.qs2
+
+
+# 2. RStudio & Mac/Windows hidden files
+.Rproj.user/
+.DS_Store
+
+/.quarto/
+.ipynb
