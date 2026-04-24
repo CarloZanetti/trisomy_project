@@ -1,23 +1,33 @@
 project:
   type: website
   output-dir: docs
+  execute-dir: project
   render:
-    - "**/*.qmd"  # The double asterisk tells it to check subfolders
-    
+    - "index.qmd"
+    - "notebooks/*.qmd"
+    - "!scripts/glmmTMB.qmd"
 
 execute:
   freeze: auto
-  
+
 website:
   title: "Trisomy scRNA-seq"
   sidebar:
     style: "docked"
     contents:
-      - text: "Seurat_v1"
+      - text: "Seurat v1"
         file: notebooks/seurat_trisomy_v1.qmd
-      - text: "Seurat_v2"
+      - text: "Seurat v2"
         file: notebooks/seurat_trisomy_v2.qmd
-      
+      - text: "glmmTMB DE (volcanos)"
+        file: notebooks/glmmTMB_DE.qmd
+      - text: "GSEA (glmmTMB, trisomy)"
+        file: notebooks/gsea_glmmTMB_trisomy.qmd
+      - text: "hdWGCNA (trisomy)"
+        file: notebooks/hdwgcna_trisomy.qmd
+      - text: "hdWGCNA + glmmTMB stats (trisomy)"
+        file: notebooks/hdwgcna_glmmTMB_stats_trisomy.qmd
+
 format:
   html:
     theme: cosmo
