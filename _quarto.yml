@@ -20,6 +20,12 @@ website:
         file: notebooks/seurat_trisomy_v1.qmd
       - text: "Seurat v2"
         file: notebooks/seurat_trisomy_v2.qmd
+      - section: "glmmTMB Volcano Plots"
+        contents:
+          - text: "Full genome"
+            file: notebooks/glmmTMB_volcanos.qmd
+          - text: "chr21 removed"
+            file: notebooks/glmmTMB_volcanos_chr21_removed.qmd
       - section: "glmmTMB DE (volcanos)"
         contents:
           - text: "Full genome"

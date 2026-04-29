@@ -1,0 +1,144 @@
+---
+title: "glmmTMB Volcano Plots (chr21 removed)"
+format: html
+---
+
+Volcano plots for the trisomy effect (Trisomic A vs Disomic B) in each plaque background (NLGF, hAPP), derived from the glmmTMB model fitted in `scripts/glmmTMB_no_chr21.qmd` (chromosome 21 genes excluded prior to model fitting). Points are coloured by direction and significance; top 20 up- and down-regulated genes are labelled.
+
+**Inputs:** `output/run1/objects/no_chr21/glmmTMB_with_interactions_corrected.qs2`
+
+## Load libraries
+
+```{r}
+library(qs2)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+```
+
+## Load data
+
+```{r}
+run_num <- "run1"
+objects_dir  <- file.path("output", run_num, "objects")
+no_chr21_dir <- file.path(objects_dir, "no_chr21")
+
+required_input <- file.path(no_chr21_dir, "glmmTMB_with_interactions_corrected.qs2")
+if (!file.exists(required_input)) {
+  message("Required input not found: ", required_input,
+          "\nRun scripts/glmmTMB_no_chr21.qmd first.")
+  knitr::knit_exit()
+}
+final_df <- qs_read(required_input)
+```
+
+## Volcano plots — Trisomy effect (A vs B)
+
+```{r}
+volcano_cols <- c(
+  "Upregulated"     = "#e41a1c",
+  "Downregulated"   = "#377eb8",
+  "Not Significant" = "grey80"
+)
+
+generate_volcano <- function(df, bg_label) {
+
+  dat <- df %>%
+    filter(contrast == "A - B", Background == bg_label) %>%
+    mutate(
+      Status = case_when(
+        FDR < 0.05 & estimate >  0.5 ~ "Upregulated",
+        FDR < 0.05 & estimate < -0.5 ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    ) %>%
+    group_by(Status) %>%
+    mutate(GroupRank = rank(FDR)) %>%
+    ungroup() %>%
+    mutate(
+      Label = case_when(
+        Status != "Not Significant" & GroupRank <= 20 ~ Gene,
+        TRUE ~ NA_character_
+      )
+    )
+
+  n_up   <- sum(dat$Status == "Upregulated")
+  n_down <- sum(dat$Status == "Downregulated")
+
+  ggplot(dat, aes(x = estimate, y = -log10(FDR), fill = Status, color = Status)) +
+    geom_point(aes(size = Status, alpha = Status), shape = 21, stroke = 0.2) +
+    scale_fill_manual(values = volcano_cols) +
+    scale_color_manual(values = c(
+      "Upregulated"     = "black",
+      "Downregulated"   = "black",
+      "Not Significant" = "grey90"
+    )) +
+    scale_size_manual(values = c(
+      "Upregulated"     = 3,
+      "Downregulated"   = 3,
+      "Not Significant" = 1.5
+    )) +
+    scale_alpha_manual(values = c(
+      "Upregulated"     = 1,
+      "Downregulated"   = 1,
+      "Not Significant" = 0.3
+    )) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               color = "grey30", linewidth = 0.8) +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed",
+               color = "grey30", linewidth = 0.8) +
+    geom_label_repel(
+      aes(label = Label),
+      fill = "white", color = "black", fontface = "bold", size = 3.5,
+      box.padding = 0.5, point.padding = 0.5,
+      min.segment.length = 0, segment.color = "grey50", max.overlaps = 50
+    ) +
+    labs(
+      title    = paste0("Trisomy effect (A vs B) — ", bg_label, " background (chr21 removed)"),
+      subtitle = paste0(
+        "Top 20 genes labelled | FDR < 0.05 | |estimate| > 0.5",
+        "  |  Up: ", n_up, "  Down: ", n_down
+      ),
+      x = "Estimate (log FC, glmmTMB)",
+      y = bquote(bold("-Log"[10] ~ "FDR"))
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 18, hjust = 0),
+      plot.subtitle    = element_text(size = 12, color = "grey40", margin = margin(b = 10)),
+      axis.title       = element_text(face = "bold", size = 14),
+      axis.text        = element_text(face = "bold", color = "black"),
+      axis.line        = element_line(color = "black", linewidth = 1),
+      axis.ticks       = element_line(color = "black", linewidth = 1),
+      legend.position  = "top",
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 12, face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey95")
+    )
+}
+```
+
+### NLGF background
+
+```{r fig.width=10, fig.height=7}
+generate_volcano(final_df, "NLGF")
+```
+
+### hAPP background
+
+```{r fig.width=10, fig.height=7}
+generate_volcano(final_df, "hAPP")
+```
+
+## Top significant genes
+
+```{r}
+final_df %>%
+  filter(contrast == "A - B", !is.na(Background), FDR < 0.05) %>%
+  arrange(Background, FDR) %>%
+  group_by(Background) %>%
+  slice_head(n = 20) %>%
+  select(Background, Gene, estimate, FDR, Interaction_FDR) %>%
+  ungroup()
+```

@@ -7,3 +7,14 @@ format: html
 
 1. [Seurat v1](notebooks/seurat_trisomy_v1.qmd)
 2. [Seurat v2](notebooks/seurat_trisomy_v2.qmd)
+3. glmmTMB Volcano Plots
+   - [Full genome](notebooks/glmmTMB_volcanos.qmd)
+   - [chr21 removed](notebooks/glmmTMB_volcanos_chr21_removed.qmd)
+4. glmmTMB DE (interaction plots, ISG, top genes)
+   - [Full genome](notebooks/glmmTMB_DE.qmd)
+   - [chr21 removed](notebooks/glmmTMB_DE_chr21_removed.qmd)
+5. GSEA (glmmTMB, trisomy)
+   - [Full genome](notebooks/gsea_glmmTMB_trisomy.qmd)
+   - [chr21 removed](notebooks/gsea_glmmTMB_trisomy_chr21_removed.qmd)
+6. [hdWGCNA (trisomy)](notebooks/hdwgcna_trisomy.qmd)
+7. [hdWGCNA + glmmTMB stats (trisomy)](notebooks/hdwgcna_glmmTMB_stats_trisomy.qmd)
