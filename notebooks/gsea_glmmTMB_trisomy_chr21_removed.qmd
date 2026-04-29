@@ -1,0 +1,402 @@
+---
+title: "GSEA (glmmTMB, trisomy, chr21 removed)"
+format: html
+---
+
+Runs gene set enrichment analysis (fgsea) on glmmTMB differential expression results from the chromosome-21-excluded model (`scripts/glmmTMB_no_chr21.qmd`). Covers four contrasts: trisomy effect in hAPP and NLGF backgrounds, and background effect in trisomic and disomic cells. Gene sets include Mancuso 2024 signatures, custom module lists, and GO/KEGG pathways.
+
+**Inputs:** `output/run1/objects/no_chr21/glmmTMB_with_interactions_corrected.qs2`; Mancuso geneset TXTs (`../../Mancuso2024_genesets/`); Magda modules Excel; GO/KEGG `.gmt`
+**Outputs:** CSV tables and barplot PDFs written to `output/run1/glmmTMB/GSEA/no_chr21/`
+
+## Load libraries
+
+```{r, message=FALSE}
+library(SingleCellExperiment)
+library(edgeR)
+library(limma)
+library(scuttle)
+library(Seurat)
+library(qs2)
+library(ggrepel)
+library(ggplot2)
+library(stringr)
+library(glue)
+library(dplyr)
+library(msigdbr)
+library(fgsea)
+library(viridis)
+library(readxl)
+```
+
+## Load directories
+
+```{r}
+run_num <- "run1"
+
+out_dir     <- file.path("output", run_num, "glmmTMB", "GSEA", "no_chr21")
+graphs_dir  <- file.path(out_dir, "graphs")
+objects_dir <- file.path(out_dir, "objects")
+
+dir.create(graphs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Read in data
+
+```{r}
+required_input <- file.path("output", run_num, "objects", "no_chr21", "glmmTMB_with_interactions_corrected.qs2")
+if (!file.exists(required_input)) {
+  message("Required input not found: ", required_input, "\nRun scripts/glmmTMB_no_chr21.qmd first.")
+  knitr::knit_exit()
+}
+final_df <- qs_read(required_input)
+```
+
+## Prepare rank vectors
+
+```{r}
+create_glmm_rank <- function(df, target_background = NA, target_ploidy = NA, target_contrast) {
+
+  if (!is.na(target_background)) {
+    sub_df <- df %>% filter(Background == target_background & contrast == target_contrast)
+  } else if (!is.na(target_ploidy)) {
+    sub_df <- df %>% filter(Ploidy == target_ploidy & contrast == target_contrast)
+  }
+
+  if(nrow(sub_df) == 0) {
+    stop(glue("No rows found. Check your target_background, target_ploidy, and target_contrast spelling!"))
+  }
+
+  sub_df <- sub_df %>%
+    mutate(rank_metric = log2FC)
+
+  ranks <- sub_df$rank_metric
+  names(ranks) <- sub_df$Gene
+
+  ranks <- ranks[!is.na(ranks) & !is.na(names(ranks))]
+  return(sort(ranks, decreasing = TRUE))
+}
+
+comparisons_master <- list(
+  "hAPP Trisomy vs Disomy"  = create_glmm_rank(final_df, target_background = "hAPP", target_contrast = "T - D"),
+  "NLGF Trisomy vs Disomy"  = create_glmm_rank(final_df, target_background = "NLGF", target_contrast = "T - D"),
+  "T NLGF vs T hAPP"        = create_glmm_rank(final_df, target_ploidy = "T",        target_contrast = "NLGF - hAPP"),
+  "D NLGF vs D hAPP"        = create_glmm_rank(final_df, target_ploidy = "D",        target_contrast = "NLGF - hAPP")
+)
+```
+
+## GSEA function
+
+```{r}
+run_gsea_analysis <- function(ranks,
+                              comparison_name,
+                              geneset_name,
+                              pathways,
+                              base_objects_dir,
+                              base_graphs_dir,
+                              group_A_label = "Group A",
+                              group_B_label = "Group B",
+                              color_A = "#EE7733",
+                              color_B = "#33BBEE") {
+
+  message(glue("Running GSEA | Set: {geneset_name} | Comp: {comparison_name}"))
+
+  current_objects_dir <- file.path(base_objects_dir, "GSEA_Analysis", comparison_name)
+  current_graphs_dir  <- file.path(base_graphs_dir, "GSEA_Analysis", comparison_name)
+
+  dir.create(current_objects_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(current_graphs_dir, recursive = TRUE, showWarnings = FALSE)
+
+  set.seed(42)
+  fgsea_res <- fgsea(
+    pathways = pathways,
+    stats    = ranks,
+    minSize  = 15,
+    maxSize  = 3000,
+    nproc    = 1
+  )
+
+  if (nrow(fgsea_res) == 0) {
+    warning(glue("No significant pathways for {geneset_name} in {comparison_name}"))
+    return(NULL)
+  }
+
+  fgsea_res_tidy <- fgsea_res %>%
+    as_tibble() %>%
+    mutate(leadingEdge = sapply(leadingEdge, paste, collapse = ",")) %>%
+    mutate(pathway = gsub("_geneset", "", pathway)) %>%
+    arrange(padj)
+
+  csv_name <- glue("Table_{geneset_name}.csv")
+  write.csv(fgsea_res_tidy, file.path(current_objects_dir, csv_name), row.names = FALSE)
+
+  top_gsea <- fgsea_res_tidy %>%
+    arrange(desc(NES)) %>%
+    slice_head(n = 10) %>%
+    bind_rows(fgsea_res_tidy %>% arrange(NES) %>% slice_head(n = 10)) %>%
+    distinct(pathway, .keep_all = TRUE) %>%
+    mutate(
+      sig_label = case_when(
+        padj < 0.001 ~ "***",
+        padj < 0.01  ~ "**",
+        padj < 0.05  ~ "*",
+        TRUE         ~ ""
+      ),
+      fill_group = ifelse(NES > 0, group_A_label, group_B_label),
+      pathway = factor(pathway, levels = unique(pathway[order(NES)]))
+    )
+
+  if (nrow(top_gsea) == 0) return(fgsea_res_tidy)
+
+  axis_zoom <- 3.5
+
+  plot_title <- glue("{sub('_.*', '', comparison_name)} ({geneset_name})")
+
+  p <- ggplot(top_gsea, aes(x = NES, y = pathway, fill = fill_group)) +
+
+    geom_col(width = 0.7) +
+
+    geom_text(aes(label = sig_label, hjust = ifelse(NES > 0, 1.2, -0.2)),
+              color = "white", size = 5, vjust = 0.75, fontface = "bold") +
+
+    scale_fill_manual(values = setNames(c(color_A, color_B), c(group_A_label, group_B_label))) +
+
+    scale_x_continuous(
+      breaks = seq(-axis_zoom, axis_zoom, 0.5),
+      labels = function(x) ifelse(x %% 1 == 0, x, "")
+    ) +
+
+    labs(x = "NES", y = NULL, title = plot_title) +
+    theme_bw(base_size = 14) +
+
+    theme(
+      panel.grid.major.x = element_line(color = "grey92", linewidth = 0.5),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor   = element_blank(),
+
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.5),
+      legend.position = "none",
+
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(b = 40)),
+
+      plot.margin = margin(t = 20, r = 10, b = 10, l = 10, unit = "pt")
+    ) +
+
+    annotate("text", x = -axis_zoom/2, y = Inf,
+             label = glue("^ {group_B_label}"), color = color_B, size = 5, fontface = "bold", vjust = -1.0) +
+    annotate("text", x = axis_zoom/2, y = Inf,
+             label = glue("^ {group_A_label}"), color = color_A, size = 5, fontface = "bold", vjust = -1.0) +
+
+    coord_cartesian(xlim = c(-axis_zoom, axis_zoom), clip = "off")
+
+  plot_name <- glue("Barplot_{geneset_name}.pdf")
+
+  dynamic_height <- 2 + (nrow(top_gsea) * 0.3)
+
+  max_len <- max(nchar(as.character(top_gsea$pathway)))
+  dynamic_width <- 5 + (max_len * 0.12)
+
+  ggsave(filename = file.path(current_graphs_dir, plot_name),
+         plot = p,
+         width = dynamic_width,
+         height = dynamic_height,
+         limitsize = FALSE)
+
+  return(fgsea_res_tidy)
+}
+```
+
+## Config and gene sets
+
+```{r}
+GLOBAL_CONFIG <- list(
+  output_dir = file.path(out_dir, "GSEA_Results_Master"),
+  group_A    = "Group A",
+  group_B    = "Group B",
+  col_A      = "#EE7733",
+  col_B      = "#33BBEE"
+)
+
+# 1. Mancuso (TXT files)
+mancuso_dir <- "../../Mancuso2024_genesets"
+mancuso_files <- list.files(path = mancuso_dir, pattern = "\\.txt$")
+mancuso_list <- lapply(mancuso_files, function(x) {
+  scan(file.path(mancuso_dir, x), what = "character", quiet = TRUE)
+})
+names(mancuso_list) <- gsub(".txt$", "", mancuso_files)
+
+# 2. Magda (Excel)
+module_data <- read_excel("/camp/home/zanettc/home/shared/zanettc/external_data/magda_modules.xlsx")
+magda_list <- lapply(module_data, function(x) unique(na.omit(as.character(x))))
+magda_list <- magda_list[sapply(magda_list, length) > 0]
+
+#3. GO / KEGG
+go_pathways <- gmtPathways("../../GO_human_all_genesets.gmt")
+kegg_df <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:KEGG_MEDICUS")
+kegg_list <- split(x = kegg_df$gene_symbol, f = kegg_df$gs_name)
+go_kegg_list <- c(go_pathways, kegg_list)
+
+
+gene_sets_master <- list(
+  "Mancuso" = mancuso_list,
+  "Magda"   = magda_list,
+  "GO_KEGG" = go_kegg_list
+)
+```
+
+## Execution loop
+
+```{r}
+purrr::walk2(names(gene_sets_master), gene_sets_master, function(gset_name, gset_pathways) {
+  purrr::walk2(comparisons_master, names(comparisons_master), function(ranks, comp_name) {
+
+    if (str_detect(comp_name, "Trisomy vs Disomy")) {
+      label_A <- "Trisomy"
+      label_B <- "Disomy"
+    } else if (str_detect(comp_name, "NLGF vs.*hAPP")) {
+      label_A <- "NLGF"
+      label_B <- "hAPP"
+    } else {
+      label_A <- "Group A"
+      label_B <- "Group B"
+    }
+
+    run_gsea_analysis(
+      ranks            = ranks,
+      comparison_name  = comp_name,
+      geneset_name     = gset_name,
+      pathways         = gset_pathways,
+      base_objects_dir = objects_dir,
+      base_graphs_dir  = graphs_dir,
+      group_A_label    = label_A,
+      group_B_label    = label_B,
+      color_A          = GLOBAL_CONFIG$col_A,
+      color_B          = GLOBAL_CONFIG$col_B
+    )
+
+    gc()
+  })
+})
+```
+
+## Single pathway enrichment plot
+
+```{r}
+term_to_plot <- "KEGG_MEDICUS_REFERENCE_TRANSLATION_INITIATION"
+
+all_pathways_flat <- do.call(c, unname(gene_sets_master))
+
+if (!term_to_plot %in% names(all_pathways_flat)) {
+  stop(glue("Could not find pathway '{term_to_plot}' in gene_sets_master."))
+}
+
+pathway_genes <- all_pathways_flat[[term_to_plot]]
+
+specific_graphs_dir <- file.path(graphs_dir, "Specific_Pathway_Plots")
+dir.create(specific_graphs_dir, showWarnings = FALSE, recursive = TRUE)
+
+purrr::walk2(comparisons_master, names(comparisons_master), function(ranks, comp_name) {
+
+  message(glue("Plotting {term_to_plot} for {comp_name}..."))
+
+  gsea_plot <- plotEnrichment(pathway_genes, ranks) +
+    labs(
+      title = term_to_plot,
+      subtitle = glue("Comparison: {comp_name}"),
+      x = "Rank",
+      y = "Enrichment Score"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+      panel.grid = element_blank()
+    )
+
+  ggsave(
+    filename = file.path(specific_graphs_dir, glue("{term_to_plot}_{comp_name}.pdf")),
+    plot = gsea_plot,
+    width = 8,
+    height = 5
+  )
+})
+```
+
+## Combined GSEA plots
+
+### Define function
+
+```{r}
+plot_combined_gsea <- function(pathway_name, rank_list, pathways_obj, graphs_dir) {
+
+  safe_pathway_name <- gsub("[[:punct:]]", "_", pathway_name)
+
+  if (!pathway_name %in% names(pathways_obj)) {
+    warning(glue("Pathway '{pathway_name}' not found in the provided pathway object."))
+    return(NULL)
+  }
+
+  gene_set <- pathways_obj[[pathway_name]]
+  plot_data_list <- list()
+
+  for (comp_name in names(rank_list)) {
+
+    ranks <- rank_list[[comp_name]]
+
+    g <- suppressMessages(plotEnrichment(gene_set, ranks))
+
+    df <- g$data
+    df$Comparison <- comp_name
+
+    plot_data_list[[comp_name]] <- df
+  }
+
+  combined_df <- bind_rows(plot_data_list)
+
+  p <- ggplot(combined_df, aes(x = rank, y = ES, color = Comparison)) +
+    geom_line(linewidth = 1.2, alpha = 0.8) +
+
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+
+    labs(
+      title = pathway_name,
+      x = "Gene Rank",
+      y = "Enrichment Score"
+    ) +
+
+    scale_color_brewer(palette = "Set1") +
+
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      panel.grid.minor = element_blank()
+    )
+
+  combined_out_dir <- file.path(graphs_dir, "Combined_GSEA_Plots")
+  dir.create(combined_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  file_name <- file.path(combined_out_dir, glue("{safe_pathway_name}_Combined.pdf"))
+
+  ggsave(filename = file_name, plot = p, width = 8, height = 6)
+
+  return(p)
+}
+```
+
+### Combined enrichment — specific term
+
+```{r}
+term_to_plot <- "KEGG_MEDICUS_REFERENCE_TRANSLATION_INITIATION"
+
+all_pathways_flat <- do.call(c, unname(gene_sets_master))
+
+combined_plot <- plot_combined_gsea(
+  pathway_name = term_to_plot,
+  rank_list    = comparisons_master,
+  pathways_obj = all_pathways_flat,
+  graphs_dir   = graphs_dir
+)
+
+print(combined_plot)
+```

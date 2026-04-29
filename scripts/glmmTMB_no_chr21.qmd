@@ -1,0 +1,219 @@
+---
+title: "glmmTMB (no chr21)"
+format: html
+---
+
+Same negative-binomial glmmTMB analysis as `glmmTMB.qmd`, but excludes genes located on chromosome 21 prior to model fitting. Chromosome assignments are taken from `~/home/shared/zanettc/gene_info.csv`. Outputs are written to a `no_chr21/` subfolder so they are clearly separated from the full-genome run.
+
+> **Note:** This script is excluded from the Quarto render list — it exists as a reference and is not compiled to HTML.
+
+**Inputs:**
+- `output/run1/objects/prelabelled_integrated_rpca.qs2`
+- `~/home/shared/zanettc/gene_info.csv`
+
+**Outputs:**
+- `output/run1/objects/no_chr21/glmmTMB_with_interactions.qs2`
+- `output/run1/objects/no_chr21/glmmTMB_with_interactions_corrected.qs2`
+
+## Load libraries
+
+```{r}
+library(Seurat)
+library(glmmTMB)
+library(emmeans)
+library(car)
+library(utils)
+library(qs2)
+library(foreach)
+library(doSNOW)
+library(parallel)
+library(dplyr)
+library(readr)
+```
+
+## Load directories
+
+```{r}
+run_num <- "run1"
+
+out_dir <- file.path("output", run_num)
+graphs_dir <- file.path(out_dir, "graphs")
+objects_dir <- file.path(out_dir, "objects")
+no_chr21_dir <- file.path(objects_dir, "no_chr21")
+
+dir.create(graphs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(no_chr21_dir, recursive = TRUE, showWarnings = FALSE)
+
+gene_info_path <- "~/home/shared/zanettc/gene_info.csv"
+```
+
+## Read in seurat object
+
+```{r}
+seurat_obj <- qs_read(file.path(objects_dir, "prelabelled_integrated_rpca.qs2"))
+```
+
+## Get raw counts and exclude chromosome 21 genes
+
+Select for genes expressed in \>=1% of cells, then drop any genes annotated to chromosome 21 in `gene_info.csv`.
+
+```{r}
+counts_matrix <- GetAssayData(seurat_obj, assay = "SCT", layer = "counts")
+
+percent_expressing <- rowMeans(counts_matrix > 0)
+genes_to_keep <- names(percent_expressing[percent_expressing >= 0.01])
+
+gene_info <- read_csv(gene_info_path, show_col_types = FALSE)
+chr21_genes <- gene_info %>% filter(chrom == "21") %>% pull(gene)
+
+n_before <- length(genes_to_keep)
+genes_to_keep <- setdiff(genes_to_keep, chr21_genes)
+n_after <- length(genes_to_keep)
+cat(sprintf("Excluded %d chromosome 21 genes (%d -> %d genes for modelling).\n",
+            n_before - n_after, n_before, n_after))
+
+counts_matrix <- counts_matrix[genes_to_keep, ]
+```
+
+## Set up metadata
+
+```{r}
+meta <- seurat_obj@meta.data
+rm(seurat_obj); gc()
+```
+
+## Running glmmTMB
+
+Genes are processed in chunks with the worker cluster restarted between chunks. This caps cumulative per-fit memory growth (a known issue with TMB-based models) without changing the per-gene fit, so results are identical to a single-`foreach` run on the same gene set. Per-chunk results are written to `output/run1/objects/no_chr21/chunks/` so a crashed run can be resumed by re-launching — completed chunks are skipped.
+
+```{r}
+num_cores <- 80
+chunk_size <- 500
+
+chunk_dir <- file.path(no_chr21_dir, "chunks")
+dir.create(chunk_dir, showWarnings = FALSE, recursive = TRUE)
+
+total_genes <- length(genes_to_keep)
+gene_chunks <- split(genes_to_keep, ceiling(seq_along(genes_to_keep) / chunk_size))
+n_chunks <- length(gene_chunks)
+
+cat(sprintf("Processing %d genes in %d chunks of up to %d (cluster restart between chunks).\n",
+            total_genes, n_chunks, chunk_size))
+
+for (i in seq_len(n_chunks)) {
+  chunk_file <- file.path(chunk_dir, sprintf("chunk_%04d.qs2", i))
+  if (file.exists(chunk_file)) {
+    cat(sprintf("Chunk %d/%d already done — skipping.\n", i, n_chunks))
+    next
+  }
+
+  cl <- makeCluster(num_cores)
+  registerDoSNOW(cl)
+
+  chunk_genes <- gene_chunks[[i]]
+  t0 <- Sys.time()
+  cat(sprintf("Chunk %d/%d: fitting %d genes...\n", i, n_chunks, length(chunk_genes)))
+
+  res <- foreach(gene = chunk_genes,
+                 .packages = c("glmmTMB", "emmeans", "car"),
+                 .export = c("counts_matrix", "meta"),
+                 .errorhandling = 'pass') %dopar% {
+
+    df <- data.frame(
+      Counts = round(as.numeric(counts_matrix[gene, ])),
+      Ploidy = meta$microglia,
+      Background = meta$app_genotype,
+      Mouse = meta$orig.ident,
+      Batch = meta$pool_id,
+      nCount_RNA = meta$nCount_RNA
+    )
+
+    model_fit <- tryCatch({
+      glmmTMB(Counts ~ Ploidy * Background + (1 | Mouse) + (1 | Batch) + offset(log(nCount_RNA)),
+              data = df, family = nbinom2(link = "log"))
+    }, error = function(e) return(NULL))
+
+    if (is.null(model_fit)) return(NULL)
+
+    anova_res <- tryCatch({
+      as.data.frame(car::Anova(model_fit, type = "III"))
+    }, error = function(e) return(NULL))
+
+    emm_results <- tryCatch({
+      spec1 <- pairs(emmeans(model_fit, ~ Ploidy | Background), reverse = TRUE)
+      spec2 <- pairs(emmeans(model_fit, ~ Background | Ploidy), reverse = TRUE)
+      rbind(as.data.frame(spec1), as.data.frame(spec2))
+    }, error = function(e) return(NULL))
+
+    if (is.null(emm_results) | is.null(anova_res)) return(NULL)
+
+    emm_results$Gene <- gene
+    emm_results$Interaction_P <- anova_res["Ploidy:Background", "Pr(>Chisq)"]
+    emm_results$Ploidy_Main_P <- anova_res["Ploidy", "Pr(>Chisq)"]
+    emm_results$Background_Main_P <- anova_res["Background", "Pr(>Chisq)"]
+
+    emm_results$log2FC <- emm_results$estimate / log(2)
+    emm_results$FoldChange <- exp(emm_results$estimate)
+
+    return(emm_results)
+  }
+
+  stopCluster(cl)
+  gc()
+
+  qs_save(res, chunk_file)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  cat(sprintf("Chunk %d/%d done in %.1f min, saved to %s\n", i, n_chunks, elapsed, chunk_file))
+}
+
+cat("\nCombining chunks and calculating FDR...\n")
+all_results_list <- list()
+for (i in seq_len(n_chunks)) {
+  all_results_list <- c(all_results_list,
+                        qs_read(file.path(chunk_dir, sprintf("chunk_%04d.qs2", i))))
+}
+
+final_df <- do.call(rbind, Filter(Negate(is.null), all_results_list))
+
+final_df$FDR <- p.adjust(final_df$p.value, method = "fdr")
+
+interaction_summary <- final_df %>%
+  group_by(Gene) %>%
+  summarise(Interaction_P = first(Interaction_P)) %>%
+  mutate(Interaction_FDR = p.adjust(Interaction_P, method = "fdr"))
+
+final_df <- merge(final_df, interaction_summary[, c("Gene", "Interaction_FDR")], by = "Gene")
+
+qs_save(final_df, file = file.path(no_chr21_dir, "glmmTMB_with_interactions.qs2"))
+cat("Done! Results saved.\n")
+```
+
+## Check processed output results
+
+```{r}
+final_df <- qs_read(file.path(no_chr21_dir, "glmmTMB_with_interactions.qs2"))
+```
+
+## Changed direction of comparisons
+
+Trisomy - Disomy makes more sense.
+
+```{r}
+final_df_corrected <- final_df %>%
+  mutate(
+    estimate = ifelse(contrast == "B - A", estimate * -1, estimate),
+    log2FC   = ifelse(contrast == "B - A", log2FC * -1, log2FC),
+    FoldChange = ifelse(contrast == "B - A", 1 / FoldChange, FoldChange),
+    contrast = ifelse(contrast == "B - A", "A - B", as.character(contrast))
+)
+qs_save(final_df_corrected, file.path(no_chr21_dir, "glmmTMB_with_interactions_corrected.qs2"))
+```
+
+## Inspect corrected output
+
+```{r}
+corrected_df <- qs_read(file.path(no_chr21_dir, "glmmTMB_with_interactions_corrected.qs2"))
+corrected_df %>%
+  filter(Interaction_FDR < 0.05)
+```

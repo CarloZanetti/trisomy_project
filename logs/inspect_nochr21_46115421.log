@@ -1,0 +1,19 @@
+qs2 0.1.6
+Columns: Gene, Background, Ploidy, contrast, estimate, SE, df, z.ratio, p.value, Interaction_P, Ploidy_Main_P, Background_Main_P, log2FC, FoldChange, FDR, Interaction_FDR 
+contrast values: T - D, NLGF - hAPP 
+Background values: hAPP, NLGF, . 
+Ploidy values: ., D, T 
+nrow: 58576 
+Interaction_FDR < 0.05: 172 
+  Gene Background Ploidy    contrast    estimate         SE  df    z.ratio
+1 A1BG       hAPP      .       T - D -0.03943955 0.07644157 Inf -0.5159438
+2 A1BG       NLGF      .       T - D -0.08694383 0.06569863 Inf -1.3233735
+3 A1BG          .      D NLGF - hAPP  0.08079700 0.09274004 Inf  0.8712202
+    p.value Interaction_P Ploidy_Main_P Background_Main_P      log2FC
+1 0.6058937     0.6720407     0.6058937         0.3836339 -0.05689925
+2 0.1857112     0.6720407     0.6058937         0.3836339 -0.12543343
+3 0.3836339     0.6720407     0.6058937         0.3836339  0.11656543
+  FoldChange       FDR Interaction_FDR
+1  0.9613281 0.7886867       0.9347359
+2  0.9167286 0.4178162       0.9347359
+3  1.0841508 0.6206211       0.9347359

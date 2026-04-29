@@ -6,6 +6,7 @@ project:
     - "index.qmd"
     - "notebooks/*.qmd"
     - "!scripts/glmmTMB.qmd"
+    - "!scripts/glmmTMB_no_chr21.qmd"
 
 execute:
   freeze: auto
@@ -19,10 +20,18 @@ website:
         file: notebooks/seurat_trisomy_v1.qmd
       - text: "Seurat v2"
         file: notebooks/seurat_trisomy_v2.qmd
-      - text: "glmmTMB DE (volcanos)"
-        file: notebooks/glmmTMB_DE.qmd
-      - text: "GSEA (glmmTMB, trisomy)"
-        file: notebooks/gsea_glmmTMB_trisomy.qmd
+      - section: "glmmTMB DE (volcanos)"
+        contents:
+          - text: "Full genome"
+            file: notebooks/glmmTMB_DE.qmd
+          - text: "chr21 removed"
+            file: notebooks/glmmTMB_DE_chr21_removed.qmd
+      - section: "GSEA (glmmTMB, trisomy)"
+        contents:
+          - text: "Full genome"
+            file: notebooks/gsea_glmmTMB_trisomy.qmd
+          - text: "chr21 removed"
+            file: notebooks/gsea_glmmTMB_trisomy_chr21_removed.qmd
       - text: "hdWGCNA (trisomy)"
         file: notebooks/hdwgcna_trisomy.qmd
       - text: "hdWGCNA + glmmTMB stats (trisomy)"
