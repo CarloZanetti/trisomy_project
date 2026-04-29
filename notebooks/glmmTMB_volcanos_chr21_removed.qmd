@@ -11,6 +11,7 @@ Volcano plots for the trisomy effect (Trisomic A vs Disomic B) in each plaque ba
 
 ```{r include=TRUE, message=FALSE}
 library(qs2)
+library(Seurat)
 library(dplyr)
 library(ggplot2)
 library(ggrepel)
@@ -30,6 +31,26 @@ if (!file.exists(required_input)) {
   knitr::knit_exit()
 }
 final_df <- qs_read(required_input)
+
+seurat_input <- file.path(objects_dir, "prelabelled_integrated_rpca.qs2")
+if (!file.exists(seurat_input)) {
+  message("Required input not found: ", seurat_input,
+          "\nRun seurat_trisomy_v1/v2.qmd first.")
+  knitr::knit_exit()
+}
+seurat_obj <- qs_read(seurat_input)
+
+# avg_log_expr: per-gene mean of the SCT "data" layer (sctransform log-normalised
+# counts) across all cells in prelabelled_integrated_rpca.qs2.
+# Note: average expression is computed from all genes (chr21 genes are simply
+# absent from final_df and will not appear in any plot).
+# Used as the A-axis (average expression) in MA plots below.
+avg_expr <- rowMeans(GetAssayData(seurat_obj, assay = "SCT", layer = "data"))
+final_df <- left_join(
+  final_df,
+  data.frame(Gene = names(avg_expr), avg_log_expr = as.numeric(avg_expr)),
+  by = "Gene"
+)
 ```
 
 ## Volcano plots — Trisomy effect (A vs B)
@@ -129,6 +150,96 @@ generate_volcano(final_df, "NLGF")
 
 ```{r fig.width=10, fig.height=7}
 generate_volcano(final_df, "hAPP")
+```
+
+## MA plots — Trisomy effect (T vs D, chr21 removed)
+
+The x-axis (`avg_log_expr`) is the per-gene mean of the SCT log-normalised expression layer (`GetAssayData(assay = "SCT", layer = "data")`) across all cells in `prelabelled_integrated_rpca.qs2`. Chr21 genes are absent from the glmmTMB results and therefore absent from these plots. Top 20 significant genes per direction are labelled, ranked by average expression (highest first).
+
+```{r}
+generate_ma_plot <- function(df, bg_label) {
+
+  dat <- df %>%
+    filter(contrast == "T - D", Background == bg_label) %>%
+    mutate(
+      Status = case_when(
+        FDR < 0.05 & estimate >  0.5 ~ "Upregulated",
+        FDR < 0.05 & estimate < -0.5 ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    ) %>%
+    group_by(Status) %>%
+    mutate(GroupRank = rank(-avg_log_expr)) %>%
+    ungroup() %>%
+    mutate(
+      Label = case_when(
+        Status != "Not Significant" & GroupRank <= 20 ~ Gene,
+        TRUE ~ NA_character_
+      )
+    )
+
+  ggplot(dat, aes(x = avg_log_expr, y = estimate, fill = Status, color = Status)) +
+    geom_point(aes(size = Status, alpha = Status), shape = 21, stroke = 0.2) +
+    scale_fill_manual(values = c(
+      "Upregulated"     = "#e41a1c",
+      "Downregulated"   = "#377eb8",
+      "Not Significant" = "grey80"
+    )) +
+    scale_color_manual(values = c(
+      "Upregulated"     = "black",
+      "Downregulated"   = "black",
+      "Not Significant" = "grey90"
+    )) +
+    scale_size_manual(values = c(
+      "Upregulated"     = 3,
+      "Downregulated"   = 3,
+      "Not Significant" = 1.5
+    )) +
+    scale_alpha_manual(values = c(
+      "Upregulated"     = 1,
+      "Downregulated"   = 1,
+      "Not Significant" = 0.3
+    )) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+    geom_hline(yintercept = c(-0.5, 0.5), linetype = "dashed", color = "grey30") +
+    geom_label_repel(
+      aes(label = Label),
+      fill = "white", color = "black", fontface = "bold", size = 3.5,
+      min.segment.length = 0, max.overlaps = 50
+    ) +
+    labs(
+      title    = paste0("MA Plot: Trisomy effect (T vs D) — ", bg_label, " background (chr21 removed)"),
+      subtitle = "Top 20 genes labelled per direction | FDR < 0.05 | |estimate| > 0.5\nx-axis: mean SCT log-normalised expression across all cells",
+      x = "Mean SCT log-normalised expression (avg_log_expr)",
+      y = "Estimate (log FC, glmmTMB)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 18, hjust = 0),
+      plot.subtitle    = element_text(size = 12, color = "grey40", margin = margin(b = 10)),
+      axis.title       = element_text(face = "bold", size = 14),
+      axis.text        = element_text(face = "bold", color = "black"),
+      axis.line        = element_line(color = "black", linewidth = 1),
+      axis.ticks       = element_line(color = "black", linewidth = 1),
+      legend.position  = "top",
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 12, face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey95")
+    )
+}
+```
+
+### NLGF background
+
+```{r fig.width=10, fig.height=7}
+generate_ma_plot(final_df, "NLGF")
+```
+
+### hAPP background
+
+```{r fig.width=10, fig.height=7}
+generate_ma_plot(final_df, "hAPP")
 ```
 
 ## Top significant genes

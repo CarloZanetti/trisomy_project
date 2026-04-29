@@ -119,7 +119,7 @@ Each pool is processed independently to confirm quality on the clean data and re
 
 Gene sets for non-microglial cell types (provided by Emma) and Mancuso 2024 microglial states are loaded here for use in both batch-level and integrated scoring.
 
-```{r}
+```{r warning=FALSE, message=FALSE}
 sig_dir <- file.path(base_dir, "signatures")
 
 gs_myeloid       <- readLines(file.path(sig_dir, "myeloid.txt"))
@@ -142,7 +142,7 @@ gs_tcrm <- readLines(file.path(mancuso_dir, "transCRM_geneset.txt"))
 
 Each batch is normalised with SCTransform, reduced with PCA, and embedded with UMAP. Clustering at resolution 0.2 generates initial cluster assignments for module scoring.
 
-```{r}
+```{r warning=FALSE, message=FALSE}
 batches <- SplitObject(seu_h_f, split.by = "pool_id")
 
 options(future.globals.maxSize = 8912896000000)
@@ -186,7 +186,7 @@ batches <- qs_read(file.path(objects_dir, "umap_batches.qs2"))
 
 ## Clustering
 
-```{r}
+```{r message=FALSE}
 res <- 0.2
 batches <- lapply(batches, \(o) {
   set.seed(42)
@@ -225,7 +225,7 @@ batches <- lapply(files, qs_read)
 
 Gene sets are intersected against the batch feature space before scoring. `AddModuleScore` calculates average expression of each gene set relative to a randomly sampled control set, giving a background-corrected enrichment score per cell.
 
-```{r}
+```{r warning=FALSE, message=FALSE}
 myeloid_seu    <- intersect(gs_myeloid,       rownames(batches[[1]]))
 prolif_seu     <- intersect(gs_proliferating, rownames(batches[[1]]))
 macrophage_seu <- intersect(gs_macrophage,    rownames(batches[[1]]))
@@ -283,7 +283,7 @@ batches <- lapply(seq_along(batches), function(i) {
 
 Batches are merged back into a single object and re-normalised with SCTransform v2. PCA is run on the merged, unintegrated object to provide the input embedding required by RPCA. Integration with `IntegrateLayers` (RPCA method) corrects pool-level batch effects while aiming to preserve biological variance.
 
-```{r}
+```{r warning=FALSE}
 merged_obj <- merge(batches[[1]], y = batches[-1])
 Idents(merged_obj) <- "pool_id"
 
@@ -308,7 +308,7 @@ merged_obj <- IntegrateLayers(
 
 Neighbours are found on the integrated RPCA reduction and clusters are identified at resolution 0.15. A UMAP is computed on the same integrated reduction for visualisation.
 
-```{r}
+```{r message=FALSE}
 set.seed(42)
 merged_obj <- FindNeighbors(merged_obj, reduction = glue("integrated.{int_method}"), dims = 1:30)
 
@@ -405,7 +405,7 @@ ggsave(filename = file.path(graphs_dir, int_method, cluster_resolution, glue("in
 
 `JoinLayers` collapses the separate per-pool raw count matrices into a single layer, required for downstream functions. Log-normalisation corrects for differences in sequencing depth, and `ScaleData` z-scores expression so that highly expressed genes do not dominate dotplots and heatmaps.
 
-```{r}
+```{r message=FALSE}
 DefaultAssay(merged_obj) <- "RNA"
 merged_obj <- JoinLayers(merged_obj, assay = "RNA")
 merged_obj <- NormalizeData(merged_obj)
@@ -416,7 +416,7 @@ merged_obj <- ScaleData(merged_obj)
 
 Module scores are calculated for all Mancuso microglial states and non-microglial cell types on the integrated object. Gene sets are re-intersected here against the merged object feature space. Scores are plotted per cluster to confirm that annotations from Part 1 hold on the clean dataset.
 
-```{r}
+```{r message=FALSE, warning=FALSE}
 myeloid_seu    <- intersect(gs_myeloid,       rownames(merged_obj))
 prolif_seu     <- intersect(gs_proliferating, rownames(merged_obj))
 macrophage_seu <- intersect(gs_macrophage,    rownames(merged_obj))
@@ -463,7 +463,7 @@ table(merged_obj$seurat_clusters)
 
 Marker genes are identified per cluster using a Wilcoxon rank-sum test. Only positive markers are returned, filtered to a minimum 25% detection rate and log2FC ≥ 0.25. The top 10 markers per cluster by log2FC are printed.
 
-```{r}
+```{r message=FALSE}
 DefaultAssay(merged_obj) <- "RNA"
 Idents(merged_obj) <- glue("{int_method}_clusters")
 markers <- FindAllMarkers(
@@ -480,7 +480,7 @@ top10_markers <- markers %>%
   group_by(cluster) %>%
   slice_max(n = 10, order_by = avg_log2FC)
 
-print(top10_markers)
+top10_markers
 ```
 
 ## Mitochondrial % per cluster
@@ -502,12 +502,11 @@ ggsave(
 Cluster labels are assigned based on Mancuso microglial state signatures and top marker genes identified in the previous section. Labels are applied to the Seurat identity slot for downstream plotting.
 
 ```{r}
-Idents(merged_obj)
 new_cluster_ids <- c(
   "0" = "HM_1",
   "1" = "tCRM_1",
-  "2" = "tCRM_2",
-  "3" = "DAM/HLA",
+  "2" = "DAM/HLA",
+  "3" = "tCRM_2",
   "4" = "IRM",
   "5" = "HLA/myeloid",
   "6" = "Proliferating",
