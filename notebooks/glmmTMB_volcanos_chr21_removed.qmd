@@ -9,7 +9,7 @@ Volcano plots for the trisomy effect (Trisomic A vs Disomic B) in each plaque ba
 
 ## Load libraries
 
-```{r}
+```{r include=TRUE, message=FALSE}
 library(qs2)
 library(dplyr)
 library(ggplot2)
@@ -44,7 +44,7 @@ volcano_cols <- c(
 generate_volcano <- function(df, bg_label) {
 
   dat <- df %>%
-    filter(contrast == "A - B", Background == bg_label) %>%
+    filter(contrast == "T - D", Background == bg_label) %>%
     mutate(
       Status = case_when(
         FDR < 0.05 & estimate >  0.5 ~ "Upregulated",
@@ -135,7 +135,7 @@ generate_volcano(final_df, "hAPP")
 
 ```{r}
 final_df %>%
-  filter(contrast == "A - B", !is.na(Background), FDR < 0.05) %>%
+  filter(contrast == "T - D", !is.na(Background), FDR < 0.05) %>%
   arrange(Background, FDR) %>%
   group_by(Background) %>%
   slice_head(n = 20) %>%

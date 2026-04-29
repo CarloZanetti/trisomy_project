@@ -10,7 +10,7 @@ Runs gene set enrichment analysis (fgsea) on glmmTMB differential expression res
 
 ## Load libraries
 
-```{r, message=FALSE}
+```{r include=TRUE, message=FALSE}
 library(SingleCellExperiment)
 library(edgeR)
 library(limma)

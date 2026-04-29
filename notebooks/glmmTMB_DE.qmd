@@ -10,7 +10,7 @@ Visualises differential expression results from the glmmTMB model fitted in `scr
 
 ## Load libraries
 
-```{r}
+```{r include=TRUE, message=FALSE}
 library(Seurat)
 library(glmmTMB)
 library(qs2)

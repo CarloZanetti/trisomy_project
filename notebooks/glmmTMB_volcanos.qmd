@@ -9,7 +9,7 @@ Volcano plots for the trisomy effect (Trisomic A vs Disomic B) in each plaque ba
 
 ## Load libraries
 
-```{r}
+```{r include=TRUE, message=FALSE}
 library(qs2)
 library(dplyr)
 library(ggplot2)
