@@ -120,13 +120,13 @@ run_gsea_analysis <- function(ranks,
   
   # --- 2. Run FGSEA ---
   set.seed(42)
-  fgsea_res <- fgsea(
+  fgsea_res <- suppressMessages(fgsea(
     pathways = pathways,
     stats    = ranks,
     minSize  = 15,
     maxSize  = 3000,
-    nproc    = 1 
-  )
+    nproc    = 1
+  ))
   
   if (nrow(fgsea_res) == 0) {
     warning(glue("No significant pathways for {geneset_name} in {comparison_name}"))
@@ -230,12 +230,14 @@ run_gsea_analysis <- function(ranks,
   #    - Long GO terms (60 chars) -> 5 + 7.2 = ~12.2 inches wide
   dynamic_width <- 5 + (max_len * 0.12)
   
-  ggsave(filename = file.path(current_graphs_dir, plot_name), 
-         plot = p, 
-         width = dynamic_width, 
+  ggsave(filename = file.path(current_graphs_dir, plot_name),
+         plot = p,
+         width = dynamic_width,
          height = dynamic_height,
          limitsize = FALSE) # Allows creating very large PDFs if needed
-  
+
+  print(p)
+
   return(fgsea_res_tidy)
 }
 ```

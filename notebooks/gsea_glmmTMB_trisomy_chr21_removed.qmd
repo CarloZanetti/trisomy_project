@@ -108,13 +108,13 @@ run_gsea_analysis <- function(ranks,
   dir.create(current_graphs_dir, recursive = TRUE, showWarnings = FALSE)
 
   set.seed(42)
-  fgsea_res <- fgsea(
+  fgsea_res <- suppressMessages(fgsea(
     pathways = pathways,
     stats    = ranks,
     minSize  = 15,
     maxSize  = 3000,
     nproc    = 1
-  )
+  ))
 
   if (nrow(fgsea_res) == 0) {
     warning(glue("No significant pathways for {geneset_name} in {comparison_name}"))
@@ -201,6 +201,8 @@ run_gsea_analysis <- function(ranks,
          width = dynamic_width,
          height = dynamic_height,
          limitsize = FALSE)
+
+  print(p)
 
   return(fgsea_res_tidy)
 }
