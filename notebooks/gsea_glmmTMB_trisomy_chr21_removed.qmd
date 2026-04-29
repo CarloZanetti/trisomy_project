@@ -1,6 +1,8 @@
 ---
 title: "GSEA (glmmTMB, trisomy, chr21 removed)"
 format: html
+execute:
+  warning: false
 ---
 
 Runs gene set enrichment analysis (fgsea) on glmmTMB differential expression results from the chromosome-21-excluded model (`scripts/glmmTMB_no_chr21.qmd`). Covers four contrasts: trisomy effect in hAPP and NLGF backgrounds, and background effect in trisomic and disomic cells. Gene sets include Mancuso 2024 signatures, custom module lists, and GO/KEGG pathways.
