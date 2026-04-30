@@ -40,17 +40,41 @@ if (!file.exists(seurat_input)) {
 }
 seurat_obj <- qs_read(seurat_input)
 
-# avg_log_expr: per-gene mean of the SCT "data" layer (sctransform log-normalised
-# counts) across all cells in prelabelled_integrated_rpca.qs2.
-# Note: average expression is computed from all genes (chr21 genes are simply
-# absent from final_df and will not appear in any plot).
-# Used as the A-axis (average expression) in MA plots below.
-avg_expr <- rowMeans(GetAssayData(seurat_obj, assay = "SCT", layer = "data"))
-final_df <- left_join(
-  final_df,
-  data.frame(Gene = names(avg_expr), avg_log_expr = as.numeric(avg_expr)),
-  by = "Gene"
+# Run NormalizeData on the RNA assay to guarantee the "data" layer is the
+# Seurat LogNormalize output (regardless of how the object was built upstream).
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- NormalizeData(
+  seurat_obj,
+  assay = "RNA",
+  normalization.method = "LogNormalize",
+  scale.factor = 1e6,
+  verbose = FALSE
 )
+
+# Join split layers into a single "data" layer before extracting
+seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+
+# logCPM: per-gene mean of the RNA "data" layer (LogNormalize output, scale
+# factor 1e6 so values are interpretable as log counts-per-million) across all
+# cells within each Background group. Used as the A-axis (average expression)
+# in MA plots below. Chr21 genes are excluded from final_df and therefore never
+# appear in any plot, even though they remain in the underlying Seurat object.
+data_mat <- GetAssayData(seurat_obj, assay = "RNA", layer = "data")
+bg_vec   <- as.character(seurat_obj$app_genotype)
+
+logcpm_by_bg <- lapply(
+  unique(na.omit(bg_vec)),
+  function(bg) {
+    cells <- which(!is.na(bg_vec) & bg_vec == bg)
+    data.frame(
+      Gene       = rownames(data_mat),
+      Background = bg,
+      logCPM     = rowMeans(data_mat[, cells, drop = FALSE])
+    )
+  }
+) %>% bind_rows()
+
+final_df <- left_join(final_df, logcpm_by_bg, by = c("Gene", "Background"))
 ```
 
 ## Volcano plots — Trisomy effect (A vs B)
@@ -142,19 +166,19 @@ generate_volcano <- function(df, bg_label) {
 
 ### NLGF background
 
-```{r fig.width=10, fig.height=7}
+```{r fig.width=10, fig.height=7, warning = FALSE}
 generate_volcano(final_df, "NLGF")
 ```
 
 ### hAPP background
 
-```{r fig.width=10, fig.height=7}
+```{r fig.width=10, fig.height=7, warning = FALSE}
 generate_volcano(final_df, "hAPP")
 ```
 
 ## MA plots — Trisomy effect (T vs D, chr21 removed)
 
-The x-axis (`avg_log_expr`) is the per-gene mean of the SCT log-normalised expression layer (`GetAssayData(assay = "SCT", layer = "data")`) across all cells in `prelabelled_integrated_rpca.qs2`. Chr21 genes are absent from the glmmTMB results and therefore absent from these plots. Top 20 significant genes per direction are labelled, ranked by average expression (highest first).
+The x-axis (`logCPM`) is the per-gene mean of the RNA `data` layer after running `NormalizeData(..., normalization.method = "LogNormalize", scale.factor = 1e6)` on the Seurat object (so values read as log counts-per-million), averaged across all cells within each Background group (NLGF or hAPP). Chr21 genes are absent from `final_df` and therefore from these plots. Top 20 significant genes per direction are labelled, ranked by logCPM (highest first). The x-axis is clipped just above the most abundant significant gene so the panel isn't stretched by very abundant non-significant genes.
 
 ```{r}
 generate_ma_plot <- function(df, bg_label) {
@@ -169,7 +193,7 @@ generate_ma_plot <- function(df, bg_label) {
       )
     ) %>%
     group_by(Status) %>%
-    mutate(GroupRank = rank(-avg_log_expr)) %>%
+    mutate(GroupRank = rank(-logCPM)) %>%
     ungroup() %>%
     mutate(
       Label = case_when(
@@ -178,7 +202,12 @@ generate_ma_plot <- function(df, bg_label) {
       )
     )
 
-  ggplot(dat, aes(x = avg_log_expr, y = estimate, fill = Status, color = Status)) +
+  # Clip x-axis to the range of significant genes (with a small buffer) so that
+  # very abundant non-significant genes don't stretch the panel.
+  sig_x <- dat$logCPM[dat$Status != "Not Significant"]
+  x_upper <- if (length(sig_x)) max(sig_x, na.rm = TRUE) + 0.2 else NA_real_
+
+  ggplot(dat, aes(x = logCPM, y = estimate, fill = Status, color = Status)) +
     geom_point(aes(size = Status, alpha = Status), shape = 21, stroke = 0.2) +
     scale_fill_manual(values = c(
       "Upregulated"     = "#e41a1c",
@@ -209,10 +238,11 @@ generate_ma_plot <- function(df, bg_label) {
     ) +
     labs(
       title    = paste0("MA Plot: Trisomy effect (T vs D) — ", bg_label, " background (chr21 removed)"),
-      subtitle = "Top 20 genes labelled per direction | FDR < 0.05 | |estimate| > 0.5\nx-axis: mean SCT log-normalised expression across all cells",
-      x = "Mean SCT log-normalised expression (avg_log_expr)",
+      subtitle = "Top 20 genes labelled per direction | FDR < 0.05 | |estimate| > 0.5\nx-axis: mean log-normalised RNA expression across cells in this Background",
+      x = "Mean log-normalised expression (Seurat NormalizeData)",
       y = "Estimate (log FC, glmmTMB)"
     ) +
+    coord_cartesian(xlim = c(NA, x_upper)) +
     theme_minimal(base_size = 14) +
     theme(
       plot.title       = element_text(face = "bold", size = 18, hjust = 0),
@@ -232,13 +262,13 @@ generate_ma_plot <- function(df, bg_label) {
 
 ### NLGF background
 
-```{r fig.width=10, fig.height=7}
+```{r fig.width=10, fig.height=7, warning = FALSE}
 generate_ma_plot(final_df, "NLGF")
 ```
 
 ### hAPP background
 
-```{r fig.width=10, fig.height=7}
+```{r fig.width=10, fig.height=7, warning = FALSE}
 generate_ma_plot(final_df, "hAPP")
 ```
 
